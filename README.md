@@ -7,7 +7,7 @@
 </div>
 
 <div align="center">
-<img width="600" alt="image" src="asserts/fig1.png">
+<img width="800" alt="image" src="asserts/fig1.png">
 <p>DeepSight achieves leading performance on most of metrics compared with E2E methods.</p>
 </div>
 
