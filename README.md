@@ -1,4 +1,3 @@
-# DeepSight: Long-Horizon World Modeling via Latent States Prediction for End-to-End Autonomous Driving
 <div align="center">
 
   <h1 align="center">DeepSight: Long-Horizon World Modeling via Latent States Prediction for End-to-End Autonomous Driving</h1>
