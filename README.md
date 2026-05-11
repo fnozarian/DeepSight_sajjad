@@ -2,7 +2,7 @@
 
   <h1 align="center">DeepSight: Long-Horizon World Modeling via Latent States Prediction for End-to-End Autonomous Driving</h1>
 
-
+<h3 align="center"><strong>🎉🎉CVPR 2026 🎉🎉</strong></h3>
 
 </div>
 
