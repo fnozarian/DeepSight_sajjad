@@ -12,20 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""Efficient fine-tuning of large language models.
-
-Level:
-  api, webui > chat, eval, train > data, model > hparams > extras
-
-Disable version checking: DISABLE_VERSION_CHECK=1
-Enable VRAM recording: RECORD_VRAM=1
-Force using torchrun: FORCE_TORCHRUN=1
-Set logging verbosity: LLAMAFACTORY_VERBOSITY=WARN
-Use modelscope: USE_MODELSCOPE_HUB=1
-Use openmind: USE_OPENMIND_HUB=1
-"""
-
-from .extras.env import VERSION
+import json
+from typing import TYPE_CHECKING, Any
 
 
-__version__ = VERSION
+if TYPE_CHECKING:
+    from pydantic import BaseModel
+
+
+def dictify(data: "BaseModel") -> dict[str, Any]:
+    try:  # pydantic v2
+        return data.model_dump(exclude_unset=True)
+    except AttributeError:  # pydantic v1
+        return data.dict(exclude_unset=True)
+
+
+def jsonify(data: "BaseModel") -> str:
+    try:  # pydantic v2
+        return json.dumps(data.model_dump(exclude_unset=True), ensure_ascii=False)
+    except AttributeError:  # pydantic v1
+        return data.json(exclude_unset=True, ensure_ascii=False)
