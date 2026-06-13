@@ -306,6 +306,131 @@ making the training signal **honest about the real world**.
 
 ---
 
+## Planned Experiments — is the original recipe effectively trainable? (E1/E2/E3)
+
+**Status: designed, NOT yet implemented.** Build/run each only on explicit request; this
+section is the spec to follow at that point.
+
+**Motivation.** Before swapping in JEPA we want to know whether the *current*
+DINOv3-supervised recipe trains effectively — but Bench2Drive-full is far too large/slow to
+answer that with a full training. The trick: this is not one expensive question
+("reproduce the paper") but **three small, controlled ones**, each answerable on a tiny
+slice of data:
+1. **Plumbing / capacity** — can gradients drive *both* losses down at all? (E1)
+2. **World-objective efficacy** — does the world loss actually *help the action output*, and does it even *learn*? (E2, E3)
+3. These directly de-risk JEPA: JEPA reuses the same `<|bev_token_i|>` positions / collator
+   masks / `vis_head` path, so a wiring bug found in E1 would also break JEPA; and E2/E3 tell
+   us whether JEPA is *"fix a broken component"* or *"replace a useless one."*
+
+**Shared infrastructure (build once, used by all three).**
+- *Tiny / small subset builders* — reuse [build_local_train_jsonl.py](src/tools/build_local_train_jsonl.py)
+  with `--limit` / a chosen scene list. E1 wants **N = 8–64 fixed** samples; E2/E3 want a
+  **few hundred–few thousand** diverse samples (one-per-scenario-family, coarse stride —
+  same diversity-over-density logic as the stride-25 eval).
+- *Held-out split* — a scene list **disjoint** from the training subset (and, ideally,
+  verified disjoint from the checkpoint's training data) so E2's eval is not leaked. New file
+  e.g. `local_data/heldout_scenes.txt`; eval JSONL via `build_local_infer_jsonl.py`.
+- *Eval* — existing [eval_l2.py](src/tools/eval_l2.py) (1s/2s open-loop L2) + the multi-GPU
+  inferer. (The L2 is not yet paper-matched; for E2 we only need the *relative* λ=0 vs λ=2
+  comparison, so the convention need not match the paper.)
+- *A `λ_world` knob* (needed by E2; nice for E3). Today the weight is **hard-coded**
+  `loss = loss_rec + 2*loss_gen` in
+  [modeling_qwen2_5_vl.py:~1544](src/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py#L1544).
+  Per the file-edit discipline it will be exposed **reversibly** — preferred: read an env var
+  (e.g. `DEEPSIGHT_LAMBDA_WORLD`, default `2.0`) at that line, introduced via a patched *copy*
+  of the modeling file that the `setup_local_inference.py` shim points at (originals
+  untouched; revertible). Decide the exact mechanism at implementation time.
+
+**Shared caveat — choice of start checkpoint.** Fine-tuning *from the released (converged)
+checkpoint* makes any "improvement" nearly invisible (it's already near-optimal on
+in-distribution frames). Options, per experiment: (a) **E1** — start from the released ckpt
+(fastest path to ~0, pure plumbing test); (b) **E2/E3** — either start from
+`deepsight_randinit` (real headroom, but won't converge to SOTA in budget — the *λ-delta* is
+still valid since both arms start identically), **or** start from the released ckpt but
+**evaluate on the weakest scenarios** (today's run shows `YieldToEmergencyVehicle_*` at
+0.12–0.19 vs straight scenes at 0.02 — there's headroom there). Record which start point was
+used; it changes interpretation.
+
+---
+
+### E1 — Tiny-set overfit (plumbing + capacity)
+
+- **Question / hypothesis.** Can the optimizer drive **both** `loss_rec` and `loss_gen`
+  toward ~0 on a handful of fixed samples? If yes → gradients flow end-to-end through the
+  fused sequence, the `vis_head`→DINOv3 MSE path is differentiable, and the collator's
+  `label_bev_masks`/`bevs_masks`/`template_mask` select the right positions. If `loss_gen`
+  *can't* be overfit, the world head is mis-wired (a bug JEPA would inherit).
+- **Design.** N = 8–64 fixed samples, **1 GPU, no DeepSpeed**, batch 1 (+ small grad-accum),
+  **constant LR** (try 1e-4), `max_steps` ≈ 200–500, overfit the same batch repeatedly. Base
+  off [ad_bev_train_smoke.yaml](configs/ad_bev_train_smoke.yaml) → new `configs/ad_bev_overfit.yaml`
+  (`max_steps` up, scheduler `constant`, saving off, `overwrite_cache`).
+- **Start point.** Released checkpoint (fast plumbing check). Optionally repeat from
+  `randinit` to confirm it also descends.
+- **Measure.** `loss`, `loss_rec`, `loss_gen` curves (the patched model already prints these
+  per step).
+- **Success / interpretation.** Both curves decrease monotonically to small values;
+  `loss_gen` drops well below its step-0 value (and below the E3 predict-mean floor). PASS →
+  pipeline is sound, proceed to E2. FAIL (loss_gen flat / NaN / not decreasing) → debug the
+  world-head wiring or masks *before* anything else.
+- **Cost.** Minutes on 1 GPU.
+- **Files to add (later).** `configs/ad_bev_overfit.yaml`; a tiny fixed JSONL
+  (`local_data/overfit_samples.jsonl`). No model-code change.
+
+### E2 — World-loss ablation (does the world objective help the policy?)
+
+- **Question / hypothesis.** Does the world loss improve the **action output**? Two short
+  runs identical except the world weight: **`λ_world = 0`** (text-only) vs **`λ_world = 2`**
+  (stock). Compare **held-out open-loop L2**.
+- **Design.** Same small diverse subset, same seed / steps / LR / batch for both arms; only
+  `DEEPSIGHT_LAMBDA_WORLD` differs. After each run, infer on the held-out split and score
+  with `eval_l2.py`. Base off [ad_bev_train_local.yaml](configs/ad_bev_train_local.yaml) →
+  `configs/ad_bev_ablate_lambda0.yaml` (+ the stock-λ run for the other arm). Keep the runs
+  short (time-boxed; this is a *relative* comparison, not a reproduction).
+- **Start point.** See shared caveat — prefer `randinit` (headroom) **or** released-ckpt +
+  weakest-scenario held-out eval. Both arms must share the identical start.
+- **Measure.** Held-out 1s/2s L2 for λ=0 vs λ=2; secondary: `loss_rec` trajectory-token CE,
+  and the loss curves.
+- **Success / interpretation.**
+  - `λ=2` meaningfully **better** than `λ=0` → the world objective genuinely shapes the
+    policy → **JEPA = upgrade to a working component** (strong green light).
+  - **Tie** (within noise) → the original world model is **decorative** — consistent with
+    `merge_model_weight.py` *stripping* `vis_head`/`dino` for serving and with the world head
+    being unread at inference. Then JEPA must justify its value differently (e.g. via the
+    action-conditioned / dynamics-aware angle), or the head is a candidate to drop.
+- **Cost.** Two short subset runs (multi-GPU optional).
+- **Files to add (later).** The `λ_world` env knob (patched modeling copy via the shim);
+  `configs/ad_bev_ablate_lambda0.yaml`; `local_data/heldout_scenes.txt` + its infer JSONL.
+
+### E3 — World-loss learning curve vs a trivial floor
+
+- **Question / hypothesis.** Does `loss_gen` actually predict **scene-specific** futures, or
+  does it **collapse toward the mean** DINOv3 feature? (The frozen-MSE target can be
+  dominated by a few high-variance channels / admit partial collapse — see
+  [WORLD_MODEL_JEPA.md §4.1](WORLD_MODEL_JEPA.md).)
+- **Design.** On a modest subset, compare trained `loss_gen` to cheap baselines computed
+  offline from the DINOv3 targets: **(a) predict-the-mean** floor = MSE of every prediction
+  vs the dataset-mean DINOv3 feature; **(b) random `vis_head`** MSE (step-0). Optionally add
+  a **collapse check**: variance of `vis_embeds` across samples (VICReg-style) and per-token
+  cosine spread — low variance ⇒ collapse. E3 can **piggyback on E2's `λ=2` run logs** (no
+  separate training), plus one small offline script for the floor.
+- **Measure.** Ratio `trained_loss_gen / predict_mean_floor`; prediction variance; per-token
+  cosine to target.
+- **Success / interpretation.** Trained `loss_gen` **well below** the predict-mean floor +
+  healthy prediction variance ⇒ the target is genuinely learned. Near the floor / low
+  variance ⇒ partial collapse — which *strengthens* the JEPA case (its anti-collapse
+  machinery + in-domain target are precisely the fix) and informs the **features-vs-occupancy**
+  target choice.
+- **Cost.** Cheap — mostly an offline floor computation reusing the collator's frozen-DINOv3
+  path; reads E2's training logs.
+- **Files to add (later).** A small `src/tools/dino_target_floor.py` (compute mean/variance
+  floors over a subset, reusing `ad_collator`'s DINOv3 target prep); a log-parse for the curve.
+
+**Recommended order.** **E1 → E2 (→ E3 piggybacked).** E1 (minutes) guards against a wiring
+bug; E2 answers the decisive pre-JEPA question; E3 sharpens E2's interpretation. JEPA work
+starts only after these read out.
+
+---
+
 ## Open Questions / Next Steps
 
 - [x] **Inference at scale = integration check.** Ran the multi-GPU inferer over the
@@ -430,3 +555,31 @@ confirmation that base ∉ training) and an averaging convention matched to the 
 **Next:** with integration confirmed, the JEPA changes (see *Open Questions*) can begin;
 separately, tighten the eval (held-out split + paper-matched L2 averaging) before quoting
 any reproduction number.
+
+### 2026-06-13 — designed trainability experiments (E1/E2/E3) before JEPA
+
+**TODO — to implement on request (designed today, nothing built yet):**
+- [ ] **E1 — tiny-set overfit** (plumbing + capacity: can `loss_rec` *and* `loss_gen` be driven to ~0?)
+- [ ] **E2 — world-loss ablation** (`λ_world ∈ {0, 2}`: does the world objective actually improve held-out trajectory L2?)
+- [ ] **E3 — world-loss learning curve vs trivial floor** (does `loss_gen` learn structure or collapse to the mean?)
+
+**Purpose.** Yesterday's integration check confirmed the assembled repo *runs* end-to-end,
+but it does not tell us whether the **original DINOv3-supervised recipe is effectively
+trainable** — the thing we must know before deciding JEPA is an *upgrade* vs a *replacement*.
+Training on Bench2Drive-full to find out is far too slow, so today I **designed three small,
+controlled experiments** that each answer one facet on a tiny slice of data, with explicit
+success criteria and JEPA implications. Full, implementation-ready specs (shared infra, the
+`λ_world` env knob, start-checkpoint caveat, per-experiment design / measurements / cost /
+files) are written up in
+[§ Planned Experiments — is the original recipe effectively trainable?](#planned-experiments--is-the-original-recipe-effectively-trainable-e1e2e3).
+
+- **E1** isolates plumbing/capacity (gradients flow, `vis_head`→DINOv3 path differentiable,
+  collator masks correct) — a bug here would also break JEPA, which reuses the same path.
+- **E2** is the decisive one: λ=2 beating λ=0 on held-out L2 ⇒ JEPA upgrades a *working*
+  component; a tie ⇒ the world head is *decorative* (matches it being stripped for serving and
+  unread at inference), reframing JEPA's value proposition.
+- **E3** checks whether the frozen-DINOv3 target is genuinely learned or collapses toward the
+  mean — directly informing the JEPA anti-collapse design and the features-vs-occupancy choice.
+
+**Recommended order:** E1 → E2 (→ E3 piggybacked on E2's λ=2 logs). **Nothing implemented;**
+awaiting the go-ahead to build the shared infra + per-experiment configs/scripts.
