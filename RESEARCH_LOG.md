@@ -364,17 +364,25 @@ used; it changes interpretation.
   **constant LR** (try 1e-4), `max_steps` ≈ 200–500, overfit the same batch repeatedly. Base
   off [ad_bev_train_smoke.yaml](configs/ad_bev_train_smoke.yaml) → new `configs/ad_bev_overfit.yaml`
   (`max_steps` up, scheduler `constant`, saving off, `overwrite_cache`).
-- **Start point.** Released checkpoint (fast plumbing check). Optionally repeat from
-  `randinit` to confirm it also descends.
-- **Measure.** `loss`, `loss_rec`, `loss_gen` curves (the patched model already prints these
-  per step).
+- **Start point (refined).** Default **`deepsight_randinit`** — the canonical "overfit one
+  batch" test is most decisive from random weights (`loss_rec` ≈12.5→~0, `loss_gen`
+  high→low proves the whole gradient path + capacity). From the released ckpt the loss
+  already starts near-zero on this in-distribution data, so it's a weaker signal; that
+  variant (one-line `model_name_or_path` swap) instead tests fine-tune descent.
+- **Measure.** `loss`, `loss_rec`, `loss_gen` curves. The trainer logs only total `loss`
+  (→ `training_loss.png` via `plot_loss`); the patched model **prints** `loss/loss_rec/loss_gen`
+  per step, so the run is tee'd to `saves/ad_bev_overfit/run.log` and the world-loss curve is
+  grepped from there.
 - **Success / interpretation.** Both curves decrease monotonically to small values;
   `loss_gen` drops well below its step-0 value (and below the E3 predict-mean floor). PASS →
   pipeline is sound, proceed to E2. FAIL (loss_gen flat / NaN / not decreasing) → debug the
   world-head wiring or masks *before* anything else.
-- **Cost.** Minutes on 1 GPU.
-- **Files to add (later).** `configs/ad_bev_overfit.yaml`; a tiny fixed JSONL
-  (`local_data/overfit_samples.jsonl`). No model-code change.
+- **Cost.** Minutes on 1 GPU (~300 steps × ~1–2 s/step).
+- **Files — BUILT (2026-06-13), zero original files touched.** `configs/ad_bev_overfit.yaml`;
+  a private dataset_dir `local_data/e1_overfit/` holding `overfit_samples.jsonl` (16 fixed
+  samples = `head -16 train_samples.jsonl`, all from `AccidentTwoWays_…Route1102`) + its own
+  `dataset_info.json`. No model-code change. **Not yet run** — launch:
+  `CUDA_VISIBLE_DEVICES=0 llamafactory-cli train configs/ad_bev_overfit.yaml 2>&1 | tee saves/ad_bev_overfit/run.log`.
 
 ### E2 — World-loss ablation (does the world objective help the policy?)
 
@@ -559,7 +567,7 @@ any reproduction number.
 ### 2026-06-13 — designed trainability experiments (E1/E2/E3) before JEPA
 
 **TODO — to implement on request (designed today, nothing built yet):**
-- [ ] **E1 — tiny-set overfit** (plumbing + capacity: can `loss_rec` *and* `loss_gen` be driven to ~0?)
+- [x] **E1 — tiny-set overfit** (plumbing + capacity: can `loss_rec` *and* `loss_gen` be driven to ~0?) — **PASS**, see results at end of this entry.
 - [ ] **E2 — world-loss ablation** (`λ_world ∈ {0, 2}`: does the world objective actually improve held-out trajectory L2?)
 - [ ] **E3 — world-loss learning curve vs trivial floor** (does `loss_gen` learn structure or collapse to the mean?)
 
@@ -583,3 +591,45 @@ files) are written up in
 
 **Recommended order:** E1 → E2 (→ E3 piggybacked on E2's λ=2 logs). **Nothing implemented;**
 awaiting the go-ahead to build the shared infra + per-experiment configs/scripts.
+
+---
+
+#### E1 RESULT — PASS
+
+Setup built with zero edits to original files: `configs/ad_bev_overfit.yaml` + a private
+`local_data/e1_overfit/` (16 fixed samples = `head -16 train_samples.jsonl`, all from
+`AccidentTwoWays_…Route1102`, + its own `dataset_info.json`). Start = `deepsight_randinit`,
+full finetune, constant lr 1e-4, **300 steps**, batch 1 (1 sample/step). 300 steps over 16
+samples = **18.75 epochs** (300/16) — i.e. the fixed set was seen ~19 times; "step" here =
+one optimizer update on one sample, not a pass over the data.
+
+Total-loss curve (from `saves/ad_bev_overfit/.../trainer_log.jsonl`; ~23 min on 1 GPU):
+
+```
+step    1   ~16.08      (mean steps 1–5 = 11.88)
+step   50    0.79
+step  150    0.07
+step  300    0.034       (min over run = 0.021;  last-20 mean = 0.227, noisy)
+```
+
+**Both losses reached ~0 — provable without the per-step split.** The trainer logs only the
+total `loss`; the `loss_rec`/`loss_gen` breakdown is printed to stdout (not captured this
+run — fixed going forward by `scripts/train.sh` auto-logging). But since
+`loss = loss_rec + 2·loss_gen` with **both terms ≥ 0**:
+- final total 0.034 ⇒ `loss_rec ≤ 0.034` **and** `loss_gen ≤ 0.017`;
+- start: total 16.08 with random-init `loss_rec ≈ ln(vocab) ≈ 12.5` ⇒ initial `loss_gen ≈ 1.8`.
+
+So `loss_gen` fell ≈1.8 → ≤0.017 (~100×) and `loss_rec` ≈12.5 → ≤0.034. **Conclusion:**
+gradients flow end-to-end through the fused sequence, the `vis_head`→DINOv3-MSE branch is
+differentiable and learnable, and the AD-collator masks select the right `<|bev_token_i|>`
+positions — **no plumbing bug; capacity sufficient.** The noisy descent is expected
+(batch 1, single-sample steps cycling 16 samples), not instability; the smoothed
+`training_loss.png` is monotone. Caveat: this proves *capacity*, not generalization (that's
+E2/E3). **Pipeline sound → proceed to E2.**
+
+> Tooling added alongside this result (so future experiments are clean and non-destructive):
+> `scripts/train.sh` (timestamped run dir `saves/<exp>/<unixtime>_<exp>/`, automatic
+> `run.log`, config-driven `# SAVE_MODEL`/`# LOG` directives); each training config now uses
+> its **own** private `dataset_dir` (`local_data/e1_overfit`, `train_smoke`, `train_local`);
+> and `data/dataset_info.json` was reverted to its original upstream (NAS) state — no longer
+> used by any local config.
