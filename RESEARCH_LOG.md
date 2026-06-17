@@ -946,7 +946,7 @@ init was *not* needed — seeds only vary data order, init is fixed); smoke-test
 multi-GPU, generates; untrained `base` anchor is appropriately weak). The four full-FT configs
 were a first cut; they are replaced per the regime decision below.
 
-### E2-3 training regime: LoRA, not full fine-tune (final decision to implement)
+### E2-3 training regime: LoRA, not full fine-tune (as run)
 
 **The decision.** E2-3 trains a **LoRA** adapter on the LLM trunk with the world head and the
 new-token rows fully trainable, the Qwen ViT and DINOv3 frozen — *not* full fine-tuning.
@@ -977,20 +977,26 @@ cost compromise. The world head's gradient mechanism is preserved: `loss_gen` st
 trunk via the LoRA delta (so the world objective shapes the representations the policy reads); a
 *frozen* LLM would cut that pathway and was ruled out.
 
-**Regime — what trains, what's frozen (the fixed E2-3 / future-head harness):**
+**Regime — what trains, what's frozen (the fixed E2-3 / future-head harness). The table below is
+the AS-RUN config (`configs/ad_bev_e2_3_LORA_lambda{0,2}_seed{0,1}.yaml`); deltas from the
+first sketch are flagged.** Trainable params: **779 M / 5.16 B = 15.1%** (verified at launch).
 
 | Component | Setting | Why |
 |---|---|---|
-| LLM trunk (`model.language_model.*`) | **LoRA**, rank **64**, `lora_target: all` | shared substrate the world loss shapes; low-variance, regularized |
-| World head (`vis_head`) | **fully trainable** (`additional_target`) | the object under test — must have full capacity |
+| LLM trunk (`model.language_model.*`) | **LoRA** rank **64**, alpha **128**, dropout **0.0**; `lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj` | shared substrate the world loss shapes; low-variance, regularized. **Changed from `lora_target: all`** — "all" would LoRA-wrap `vis_head`/`lm_head` (rank-capping a head that must train at full rank); explicit LLM-projection list avoids that. ViT is excluded anyway via `freeze_vision_tower`. |
+| World head (`vis_head`) | **fully trainable** (`additional_target: vis_head`) | the object under test — must have full capacity |
 | New-token rows (`embed_tokens` / `lm_head`) | **fully trainable** (`additional_target`) | start random; must converge or both arms are null (E2-1 trap) |
-| Qwen ViT (`model.visual.*`) | **frozen** | pinned substrate keeps the head's effect isolated; cuts params/noise |
+| Qwen ViT (`model.visual.*`) | **frozen** (`freeze_vision_tower: true`) | pinned substrate keeps the head's effect isolated; cuts params/noise |
 | DINOv3 (`dinov3.*`) | **frozen** (forced in code) | target feature extractor only |
-| Init | `checkpoints/deepsight_warmstart` | neutral-capable warm-start (unchanged from the design above) |
-| `num_train_epochs` | **~5** (up from 2) | LoRA underfits faster — ensure the task is actually learned before reading the effect |
-| `learning_rate` | **2.0e-4** | LoRA tolerates/needs a higher LR than full-FT |
-| seeds | **≥2** (cheap now) | estimate the noise floor for the decision rule |
-| λ_world arms | **{0, 2}** | the ablation variable |
+| Init | `checkpoints/deepsight_warmstart` | neutral-capable warm-start (built by `scripts/make_warmstart_init.py`) |
+| Dataset | **`local_data/e2_lora` — 5000 train / 1000 eval, scene-disjoint** | **Changed from `e2_overfit_lambda` (2000/500).** On 2000 samples the arms converge within ~1 epoch and overfit (see 2026-06-17 entry), so a bigger, more diverse, scene-disjoint set was built (`scripts/build_e2_lora.py`, parallel) for a generalizable, lower-variance held-out comparison. |
+| `num_train_epochs` | **3** | **Changed from ~5.** Smoothed train loss shows learning saturates ~epoch 1; 3 gives margin without heavy memorization. |
+| `learning_rate` / scheduler | **2.0e-4**, `cosine`, `warmup_ratio 0.03` | LoRA tolerates/needs a higher LR than full-FT |
+| batch | `per_device_train_batch_size 1`, `grad_accum 1` | keep effective batch constant across arms (same #GPUs) |
+| dataloader | `num_workers 8`, `persistent_workers`, `prefetch_factor 4` | **Added** — with 0 workers the GPU starved ~50% waiting on NFS image decode (15 JPEGs/sample); prefetch overlaps decode with compute |
+| `seed` | **{0, 1}** (≥2 seeds) | estimate the run-to-run noise floor for the decision rule |
+| λ_world arms | **{0, 2}** (`world_loss_weight`) | the ablation variable |
+| caching | `overwrite_cache: false` | arms share one tokenization cache → run #1 builds it, the rest reuse it (no concurrent-rebuild race) |
 
 **Unchanged from the design above:** neutral-capable warm-start init; identical setup across arms
 toggling only λ (and seed); the `base` (no-train) reference; the **pre-registered decision rule**
@@ -1002,11 +1008,116 @@ caveat applies to *any* small-scale probe (full-FT on 2000 included), so it is n
 prefer full-FT; it is a scope statement. E2's purpose is a reliable comparator for world-head
 designs, and this is exactly the harness every future world-head idea will be run through.
 
-**One plumbing change vs the design above.** LoRA run dirs are *adapters*, so the auto-eval needs
-a **merge-before-eval** step (`llamafactory-cli export` to fold the adapter + `additional_target`
-modules into a full checkpoint, then the existing infer/eval runs unchanged on that merged dir).
+**One plumbing change vs the design above — IMPLEMENTED.** LoRA run dirs are *adapters*, so the
+auto-eval merges first: `scripts/train.sh` detects `finetuning_type: lora`, writes
+`<run_dir>/export_config.yaml`, runs `llamafactory-cli export` to fold the adapter +
+`additional_target` modules (`vis_head`/`embed_tokens`/`lm_head`) into `<run_dir>/merged/`, then
+evaluates that. (Note: `export` only honours `key=value` overrides when arg 1 is a YAML file, so a
+config file is passed — verified end-to-end; the merged ckpt contains the full DeepSight arch incl.
+`dinov3`/`vis_head`.) Held-out open-loop L2 is computed on `local_data/e2_lora/heldout_lora.jsonl`.
 
-**Status: regime decided — to implement.** Build order when greenlit: (1) rewrite the 4 configs
-to `finetuning_type: lora` with the knobs above; (2) add the merge-before-eval step to
-`scripts/train.sh`; (3) run the 4 arms + `base` eval; (4) tabulate vs the decision rule under
-this day's log.
+**Status: IMPLEMENTED — sweep running.** Done: warm-start init built + smoke-verified; 4 LoRA
+configs written; `train.sh` merge-before-eval added & verified; all three regimes (full-FT randinit,
+full-FT warmstart, LoRA) smoke-passed end-to-end through `train.sh`; `e2_lora` (5k/1k) built. Run:
+`scripts/train.sh configs/ad_bev_e2_3_LORA_lambda{0,2}_seed{0,1}.yaml --eval local_data/e2_lora/heldout_lora.jsonl`
+(one GPU each; launch run #1 first so it builds the shared cache, then the rest). `base` reference =
+`deepsight_warmstart` evaluated with no training. Results → tabulated under a later log entry vs the
+pre-registered decision rule.
+
+### 2026-06-17 — E2-3 implemented; fast-convergence finding drove the data scale-up
+
+**Tooling implemented & verified.** Built the warm-start init (`scripts/make_warmstart_init.py` →
+`checkpoints/deepsight_warmstart`: base Qwen2.5-VL-3B LLM+ViT, random `vis_head`/new-token rows,
+frozen pretrained DINOv3). Made `scripts/train.sh` regime-aware (full-FT → eval run dir directly;
+LoRA → merge adapter then eval). Smoke-tested all three regimes end-to-end through the one
+`train.sh` (full-FT randinit + ZeRO-2; full-FT warmstart, λ=0 ⇒ `loss == loss_rec`; LoRA, merge→eval)
+— all passed. Two bugs found & fixed: (a) **GPU starvation** — `dataloader_num_workers: 0` left the
+GPU idle ~50% waiting on NFS decode of 15 JPEGs/sample; set workers=8 + prefetch across all configs.
+(b) **LoRA merge** — `llamafactory-cli export` ignored bare `key=value` args (only honours overrides
+when arg 1 is a YAML file), so `train.sh` now writes/export-passes a config file; verified the merged
+ckpt carries the full arch (`dinov3`/`vis_head`).
+
+**Fast-convergence finding (the reason data was scaled up).** Two LoRA arms on the 2000-sample
+`e2_overfit_lambda` set ran 5 epochs (10000 steps). Smoothed training loss shows both arms do almost
+all their learning in **epoch 1**, after which λ0 **plateaus** (memorizing 2000 samples) while λ2
+keeps declining slowly (the `loss_gen` MSE target stays informative). On so few samples the held-out
+L2 would be overfit-dominated and high-variance — a poor basis for a reliable world-loss comparison.
+
+**Decision (taken with the user).** Increase data rather than just cut epochs — decreasing epochs
+alone doesn't fix small-data overfitting/variance, whereas more diverse data does (and is exactly
+E2's goal: a reliable, low-variance comparator). Built `local_data/e2_lora` via a new, saved,
+**parallel** `scripts/build_e2_lora.py` (32-worker pool; ~3–4 min vs ~2 h serial — the work is
+NFS-stat-latency-bound): **5000 train / 1000 eval**, scene-disjoint, excluding all 155
+`e2_overfit_lambda` scenes, with asserted zero scene/sample overlap. Repointed the LoRA configs to
+it, set `num_train_epochs: 3`, `overwrite_cache: false` (shared cache, run #1 builds it). The
+2000-sample `e2_overfit_lambda` runs were the pilot that surfaced this; the reported E2-3 numbers
+will come from the `e2_lora` sweep.
+
+**Carry-over scope.** Still a small-data, pinned-trunk LoRA probe (not the paper's full-FT scale) —
+its job is a reliable *relative* world-loss comparison and a fixed harness for future world-head
+variants, not absolute paper L2.
+
+### E2-3 results & conclusion: INCONCLUSIVE — no measurable world-loss benefit (and why that may be our design)
+
+Four arms ran on `e2_lora` (5000 train / 1000 held-out, scene-disjoint; 2 epochs as-run, not the
+configured 3; ~5.1 h each; held-out open-loop L2, 100% parsed). Overall L2: λ0 seed0 **1.369**,
+λ0 seed1 **0.974**, λ2 seed0 **0.956**, λ2 seed1 **0.980**. Group means: **λ0 = 1.172 (seed spread
+0.396)**, **λ2 = 0.968 (seed spread 0.024)**.
+
+**Verdict against the pre-registered rule** (*helps ⇔ λ2 < λ0 by more than the seed spread, and
+λ2 < base*): **FAILS.** Mean gap λ0−λ2 = 0.204 < λ0's seed spread 0.396; and **base was not run** (second
+leg unverified). Reading the runs individually: **three of four cluster at ~0.95–0.98** — λ0 seed1
+(0.974) sits right on the λ2 arms — and the only high value, λ0 seed0 (1.369), simply **converged
+worse** (its train_loss 0.601 vs ~0.39–0.52 for the rest). So the apparent λ2 advantage is **driven
+entirely by one unlucky λ0 seed**, exactly the spurious single-seed signal the multi-seed protocol
+exists to reject (the E2-2 over-claim). **The protocol worked; the data is consistent with no
+measurable world-loss benefit in this regime.** (Secondary, *not* a conclusion: λ2's spread is far
+tighter than λ0's — the world loss *might* regularize training — but n=2 with one outlier is far too
+little to claim it.)
+
+### Critical: the paper claims the world head helps *remarkably*; we can't show it — what's wrong with OUR design?
+
+A null here does **not** refute the paper. More likely, **our design answers a different question
+than the paper's claim**, and several of our deliberate choices plausibly *removed the effect before
+it could appear*. In rough order of severity:
+
+1. **Wrong metric for the claim.** The paper's "remarkable" gains are **closed-loop Bench2Drive**
+   (Driving Score, Success Rate, Multi-Ability on long-tail/interactive scenarios). We measure
+   **short-horizon (1–2 s) open-loop L2**, which is largely solvable from current visual features +
+   ego kinematics *without* world modeling. The world head's value — anticipating scene evolution,
+   handling interaction/long-tail — barely projects onto 1–2 s waypoint regression. We are measuring
+   the axis least sensitive to what the world model buys.
+2. **LoRA pins the trunk, capping the world loss's mechanism.** The world objective is supposed to
+   help by *reshaping the LLM's internal representations*. We froze the trunk and let only a rank-64
+   delta + heads move — so `loss_gen` can only reshape a low-rank slice of the representations the
+   policy reads. We chose LoRA for *reliability/reproducibility*; that very choice may have designed
+   away the effect. The paper **full-fine-tunes**, where the world loss reshapes the entire trunk.
+   We optimized for a trustworthy measurement of a regime where the effect can't fully express.
+3. **Scale.** Paper: 64×H20, batch 128, full Bench2Drive, full-FT. Us: 5000 samples, batch 1, 1 GPU,
+   2 epochs, LoRA. Auxiliary-representation benefits typically **grow with data/'plasticity**; at our
+   scale the model fits the easy waypoint task directly and the world loss is marginal.
+4. **In-distribution, easy held-out.** Train/eval are scene-disjoint but same simulator/Towns/scenario
+   types. The world model is meant to pay off on **novel/long-tail/interactive** situations; an
+   in-distribution short-horizon eval doesn't stress the regime where it should matter — and both arms
+   saturate to a similar floor, leaving no room to separate them.
+5. **No internal check that the objective did anything.** `loss_gen` decreased, but we never probed
+   whether λ2's representations are actually more dynamics-aware (vs the head learning a degenerate
+   solution that doesn't transfer). A null in the policy metric with no representation diagnostic
+   can't distinguish "world loss useless" from "world loss worked internally but our metric/regime
+   can't see it."
+
+**Honest framing.** We can't currently separate two explanations — (a) **our probe is too weak/wrong
+to surface a real effect**, or (b) **the paper over-states the benefit** (or it's entangled with
+other components / only emerges closed-loop at scale). Our experiment, as built, is informative about
+neither, because we traded the conditions the claim lives in (full-FT, scale, closed-loop, long-tail)
+for conditions that are cheap and reliable (LoRA, small in-distribution data, open-loop L2). The
+reliability we gained is real, but it was bought against a regime where the world loss has little to
+do — so a clean null was, in part, **self-inflicted**.
+
+**What would actually test the claim** (in increasing fidelity): (i) run the **base** reference to
+complete the rule + add seeds 2–3 to settle the λ0 variance; (ii) **unfreeze the trunk** (full-FT or
+much higher LoRA rank / LoRA on the whole stack) so the world loss can reshape representations;
+(iii) move to a **longer-horizon / harder, more long-tail** eval split; (iv) ultimately, the only
+faithful test is **closed-loop Bench2Drive at (something closer to) the paper's scale + full-FT** —
+which our compute can't reach, so any small-scale verdict must stay scoped to "no *measurable*
+open-loop benefit in a small pinned-trunk probe," not "the world head doesn't help."
