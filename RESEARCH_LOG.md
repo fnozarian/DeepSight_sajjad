@@ -1059,6 +1059,11 @@ variants, not absolute paper L2.
 
 ### E2-3 results & conclusion: INCONCLUSIVE — no measurable world-loss benefit (and why that may be our design)
 
+> ⚠️ These are the **pilot** results, run under a 2-split setup (train + a single held-out used
+> as *test*), **no early stopping**, and L2 selected at the final step. They were the basis for the
+> protocol upgrade below (3-split + periodic eval + early stopping). The upgraded sweep supersedes
+> these numbers; conclusions here stand as the pilot read.
+
 Four arms ran on `e2_lora` (5000 train / 1000 held-out, scene-disjoint; 2 epochs as-run, not the
 configured 3; ~5.1 h each; held-out open-loop L2, 100% parsed). Overall L2: λ0 seed0 **1.369**,
 λ0 seed1 **0.974**, λ2 seed0 **0.956**, λ2 seed1 **0.980**. Group means: **λ0 = 1.172 (seed spread
@@ -1121,3 +1126,69 @@ much higher LoRA rank / LoRA on the whole stack) so the world loss can reshape r
 faithful test is **closed-loop Bench2Drive at (something closer to) the paper's scale + full-FT** —
 which our compute can't reach, so any small-scale verdict must stay scoped to "no *measurable*
 open-loop benefit in a small pinned-trunk probe," not "the world head doesn't help."
+
+### E2-3 protocol upgrade: 3-split data, periodic eval + early stopping, train-vs-eval diagnostic, FT mirror
+
+Two diagnostics motivated this upgrade:
+
+- **Fast convergence is not memorization.** Smoothed train loss does ~all its drop in epoch 1 then
+  plateaus; epoch-2 loss is only marginally below epoch-1 at the same offset (no sharp epoch-boundary
+  drop) — so it is the model hitting the task ceiling fast, not runaway overfitting. Cause: the task
+  is **easy/low-entropy** (templated answer + near-straight waypoints) on a **strong pretrained
+  warm-start** → transfer fits with little data. *Ruled out:* LoRA capacity (that would *under*fit,
+  i.e. high train loss — opposite of observed); model size is minor (only 15% low-rank params train).
+- **The world target is weak, not trivial (diagnostic on 128 held-out, faithful DINOv3 targets).**
+  A scene-agnostic per-position-mean predictor scores MSE 0.0371; the model reaches 0.027 — so it
+  *does* use scene info, but beats the floor by only **~27% of the scene variance**. DINOv3 features
+  are small (std 0.28), so the "tiny" `loss_gen≈0.03` is largely a **scale artifact** (relative
+  RMSE/std ≈ 0.6), and `loss_gen` saturates within ~100 steps → little sustained gradient. ⇒ the
+  world objective is faintly informative; a future redesign should **normalize the target** and/or
+  use a **harder (delta/contrastive/JEPA)** target. (My initial "trivial target" guess was *wrong* —
+  recorded as such.)
+
+**`eval_loss` vs L2 (why two metrics).** `eval_loss` = the *training* objective
+(`loss_rec + λ·loss_gen`) on a held-out split via one **teacher-forced forward** (cheap, scores all
+tokens incl. template). L2 = **autoregressive generation** + parse of the waypoints (expensive,
+scores only the trajectory). They can disagree (teacher-forcing hides drift; template dominates
+`eval_loss`). ⇒ use **`eval_loss` for early stopping**, **L2 on the untouched test set** for the
+final verdict.
+
+**Three scene-disjoint splits (verified train∩eval∩test = 0 at scene *and* sample level).** To stop
+selecting on the test set (the pilot's flaw):
+- `train_lora` 5000 (211 scenes) → fit; `eval_lora` 200 (43 scenes) → `eval_loss`/early stopping;
+  `test_lora` 1000 (42 scenes) → final L2. Built reproducibly (`build_e2_lora.py`,
+  `build_e2_lora_test.py`; both assert disjointness). `eval_lora` was trimmed to a 200-sample subset
+  spanning all 43 eval scenes so each eval (forward pass) stays ~4 min instead of ~20 min at 1000.
+- `local_data/e2_FT/` = a copy with `*_FT` filenames, so **FT trains on identical data** → FT-vs-LoRA
+  is a controlled comparison (only the regime differs).
+
+**Config changes (all 4 LoRA + all 4 FT arms).** `eval_dataset: bench2drive_bev_eval`,
+`eval_strategy: steps`, `eval_steps: 500`, `per_device_eval_batch_size: 1`, `save_strategy: steps` +
+`save_steps: 500` + `save_total_limit: 2` (required to align with) `load_best_model_at_end: true`,
+`metric_for_best_model: eval_loss`, `greater_is_better: false`, `early_stopping_steps: 4` (patience),
+`overwrite_cache: false` (shared cache; run #1 builds it). `train.sh` already merges the **best** LoRA
+adapter before the final L2; for FT the best full checkpoint is evaluated directly.
+
+**Early-stopping caveat (observed, not a bug).** LLaMA-Factory wires
+`EarlyStoppingCallback(patience=early_stopping_steps)` but **does not expose
+`early_stopping_threshold`** (defaults to 0). So *any* improvement — even 1e-4 — resets the patience
+counter; a slowly-but-monotonically declining `eval_loss` therefore **never triggers** a stop. Seen
+live (λ2 run): `eval_loss` set a new best at almost every eval (0.67→0.38 over 8.5k steps), so it ran
+the full 2 epochs and `load_best_model_at_end` kept the best — correct behavior, just not "stop on
+diminishing returns." To stop on a plateau we'd need to add an `early_stopping_threshold` knob
+(small edit to `finetuning_args.py` + `tuner.py`) — deferred unless wanted.
+
+**Over/under-fit diagnostic plot.** `scripts/plot_losses.py` now also emits **`train_vs_eval.png`**
+from `trainer_log.jsonl`: total train loss (`loss_rec + λ·loss_gen`) overlaid with `eval_loss`, plus
+an `eval − train` gap panel (flat = healthy, rising = overfit onset, both-flat = saturation). Built
+from already-logged data, so it needs **no rerun**; `train.sh` regenerates it at the end of every run.
+Mid-run snapshots of the live arms showed train≈eval with no widening gap → the saturation regime,
+not overfitting.
+
+**Operational note.** FT arms run multi-GPU (DDP/ZeRO), which **divides the optimizer-step count** by
+#GPUs (data-parallel): e.g. 5000 samples × 2 epochs on 2 GPUs = **5000 steps**, not 10000 — same data
+seen, fewer steps. Keep #GPUs consistent across arms being compared (effective batch must match).
+
+**Status:** upgraded LoRA sweep running (with periodic eval + early stopping + 3-split); FT arms
+configured identically on `e2_FT`. Final verdict to be tabulated (on `test_*`) once runs complete,
+plus the still-pending **base reference** and extra seeds.
