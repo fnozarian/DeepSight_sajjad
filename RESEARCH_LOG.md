@@ -1192,3 +1192,147 @@ seen, fewer steps. Keep #GPUs consistent across arms being compared (effective b
 **Status:** upgraded LoRA sweep running (with periodic eval + early stopping + 3-split); FT arms
 configured identically on `e2_FT`. Final verdict to be tabulated (on `test_*`) once runs complete,
 plus the still-pending **base reference** and extra seeds.
+
+### 2026-06-18 — E2-3 results across BOTH regimes (FT and LoRA): no detectable world-loss benefit
+
+First 2×2 of the upgraded protocol (regime × λ), **seed 0 only**, evaluated on the held-back
+**test** split (1000 samples; `test_FT` and `test_lora` are identical content — `e2_FT` is a copy
+of `e2_lora`). FT was 2 epochs on 2 GPUs (5000 steps); LoRA 2 epochs on 1 GPU (10000 steps); same
+data exposure. (FT λ2 finished training but crashed in `load_best_model_at_end` — see the
+save_total_limit note above — so its number is from the best+final `checkpoint-5000`, scored on
+test; FT λ0 completed normally.)
+
+| regime | λ | L2@1s | L2@2s | **L2 overall** | final eval_loss |
+|---|---|---|---|---|---|
+| FT   | 0 | 0.707 | 1.567 | **1.137** | 0.413 |
+| FT   | 2 | 0.703 | 1.695 | **1.199** | 0.442 |
+| LoRA | 0 | 0.551 | 1.305 | **0.928** | 0.318 |
+| LoRA | 2 | 0.555 | 1.299 | **0.927** | 0.379 |
+
+**Full exp titles (config → run dir, so the reader can reach them):**
+- FT λ0 → `configs/ad_bev_e2_3_FT_lambda0_seed0.yaml` → `saves/ad_bev_e2_3_FT_lambda0_seed0/1781729898_ad_bev_e2_3_FT_lambda0_seed0/`
+- FT λ2 → `configs/ad_bev_e2_3_FT_lambda2_seed0.yaml` → `saves/ad_bev_e2_3_FT_lambda2_seed0/1781733356_ad_bev_e2_3_FT_lambda2_seed0/`
+- LoRA λ0 → `configs/ad_bev_e2_3_LORA_lambda0_seed0.yaml` → `saves/ad_bev_e2_3_LORA_lambda0_seed0/1781709395_ad_bev_e2_3_LORA_lambda0_seed0/`
+- LoRA λ2 → `configs/ad_bev_e2_3_LORA_lambda2_seed0.yaml` → `saves/ad_bev_e2_3_LORA_lambda2_seed0/1781709872_ad_bev_e2_3_LORA_lambda2_seed0/`
+
+**World-loss effect (λ2 vs λ0, within each regime — the comparable metric):**
+- **LoRA:** 0.927 vs 0.928 → **identical** (Δ 0.001). No effect.
+- **FT:** 1.199 vs 1.137 → λ2 **~5% worse**. No help; marginally negative.
+
+⇒ **The world head improves open-loop L2 in *neither* regime.** Crucially this now holds in a
+**fully-plastic FT** regime as well as the pinned-trunk LoRA one — which **addresses the earlier
+objection** that LoRA was capping the world-loss→representation mechanism. Even with the whole trunk
+trainable, turning the world loss on did not help.
+
+**Caveats (do not over-read):**
+- **Single seed each.** The earlier multi-seed run measured a λ0 **seed spread of 0.40**; the FT
+  gap (0.06) and the LoRA gap (0.001) are both well inside that, so the FT "−5%" is **likely noise**,
+  not evidence of harm. Honest claim: *no measurable positive effect.*
+- **`eval_loss` is NOT comparable across λ** (λ2's includes the world-MSE term, λ0's does not) — only
+  the waypoint **L2** is comparable across λ, which is what the verdict uses.
+- Same standing scope limits: short-horizon **open-loop L2** is insensitive to what world-modeling
+  should buy, and the world **target is weak** (~27% of scene variance; saturates in ~100 steps).
+
+**Separate observation (orthogonal to the world loss):** **LoRA generalizes better than FT here**
+(test L2 0.93 vs 1.14–1.20; eval_loss 0.32–0.38 vs 0.41–0.44) — the expected small-data signature
+(full-FT of 3.7B on 5000 samples overfits; LoRA regularizes).
+
+**Net for E2:** consistent **null** for the world head on open-loop driving, across two training
+regimes — *not* proof it is useless (the faithful test — harder/normalized target, longer-horizon
+or closed-loop, multi-seed — is still unrun). To make this publishable-grade: **add seeds 1–2 per
+cell** (error bars on these gaps), run the **base/no-train reference**, and a **harder-slice** eval.
+
+### Paper-faithful full-FT configs (FTpaper) + protocol hardening
+
+The above used *our* recipe (lr 1e-4, trained vision tower, etc.), not the paper's. To remove the
+"our hyperparameters were wrong" confound we built a **paper-faithful** full-FT family,
+`configs/ad_bev_e2_3_FTpaper_lambda{0,2}_seed{0,1}.yaml`, after verifying the recipe against
+`tex_source/`:
+
+- **Paper hyperparameters (verified, and internally inconsistent):** main text
+  (`sec/4experiments.tex`) says **lr 2e-5, batch 128**; the implementation paragraph
+  (`main.tex:203`) says **lr 2e-4, batch 64** *and* — the key detail — **"the vision encoder is
+  frozen, the LLM is fully fine-tuned."** Our earlier FT had `freeze_vision_tower: false`
+  (unfaithful); FTpaper sets it **true**.
+- **LR decision:** use **2e-5 regardless of batch size.** The two paper pairs contradict standard
+  LR↔batch scaling (bigger batch → bigger LR, not 10× smaller), so they are not a principled pair;
+  2e-5 is the standard/safe full-FT value, and 2e-4 is aggressive (instability risk). Batch kept at
+  **64** via `gradient_accumulation_steps` (2 GPUs × 32). Consequence: 5000×2 epochs / 64 ≈ **158
+  optimizer steps** — few, the faithful large-batch-on-small-data tradeoff.
+- **Horizon = 2 s confirmed** (method §: Δt=0.5 s, 4 waypoints; world `F=[f0..f4]`=5 frames=2 s) —
+  in both open- and closed-loop. So the **3–4 s eval idea was retracted** as un-faithful; eval stays
+  1 s/2 s, matching the paper.
+- **Init provenance (`checkpoints/deepsight_warmstart`):** LLM + vision = base Qwen2.5-VL-3B; new
+  bev/pixel/CoT token rows + **`vis_head` = random**; DINOv3 = pretrained-frozen (Meta's, via the
+  DeepSight ckpt). Nothing trainable is inherited from DeepSight. This is both **neutral** (fair
+  ablation) and **faithful** (the paper also starts `vis_head` random and learns it during SFT;
+  there is no separate trajectory head — waypoints are text via `lm_head`).
+- **Early-stopping / crash hardening (all E2-3 configs):** the FT λ2 run crashed at end in
+  `load_best_model_at_end` because `save_total_limit: 2` had deleted the tracked-best checkpoint.
+  Fix: keep `load_best_model_at_end: true` but set **`save_total_limit ≥ patience+1`** (5 for
+  patience 4, 4 for patience 3) — guarantees the best (which is ≤patience evals before the stop) is
+  never rotated out, so load_best always finds it. (We briefly added an `early_stopping_threshold`
+  knob to `tuner.py`/`finetuning_args.py`, then **reverted** it: stock threshold 0 is the *correct*
+  default — early stopping is meant to fire on plateau/worsening, and our `eval_loss` was still
+  improving, so it correctly never fired.)
+- **Data factorization:** each dataset dir now holds `train.jsonl` / `eval.jsonl` / `test.jsonl`
+  (type implied by the parent dir, e.g. `e2_lora`, `e2_FT`); `dataset_dir` alone selects all three
+  (train+eval via the registry, test via `train.sh`'s `--eval` → `<dataset_dir>/test.jsonl`). The
+  eval output was renamed `heldout_infer.json` → **`test_infer.json`**.
+
+### 2026-06-19 — FTpaper results: the pipeline is VALID; the world head still shows no benefit
+
+Ran the paper-faithful arms (seed 0 each; full-FT LLM, frozen vision, frozen DINOv3, lr 2e-5,
+effective batch 64, 2 epochs = 158 steps; eval on the held-back `test` split, 1000 samples):
+- λ0 → `configs/ad_bev_e2_3_FTpaper_lambda0_seed0.yaml` → `saves/ad_bev_e2_3_FTpaper_lambda0_seed0/1781793081_…/`
+- λ2 → `configs/ad_bev_e2_3_FTpaper_lambda2_seed0.yaml` → `saves/ad_bev_e2_3_FTpaper_lambda2_seed0/1781798673_…/`
+
+| arm | L2@1s | L2@2s | **L2 overall** | final eval_loss | train loss (first→last) |
+|---|---|---|---|---|---|
+| FTpaper λ0 | 0.609 | 1.438 | **1.024** | 0.347 | 4.83 → 0.285 |
+| FTpaper λ2 | 0.702 | 1.584 | **1.143** | 0.461* | 36.4 → 0.395 |
+
+*λ2 eval_loss includes the world-MSE term, so it is NOT comparable to λ0's — only L2 is.
+
+**Did the pipeline work? YES.** With the faithful large-batch recipe the training is clean and
+well-behaved: `eval_loss` falls **smoothly and monotonically** (λ0: 1.10→0.35; λ2: 1.51→0.46 over
+the 7 evals), the model clearly learns (test L2 ≈ 1.0, in the same band as the other regimes), and
+every component is wired (collator → BEV targets → `loss_gen` trains → `vis_head` predicts →
+waypoints/CoT generate & parse 100% → test eval). So the **faithful, working small-scale pipeline
+we were searching for is achieved.** (Minor: `eval_loss` is still inching down at step 140 → the
+158-step/2-epoch budget is slightly short — the faithful large-batch-on-small-data consequence.)
+
+**Did the world head help? NO — and now even in the faithful regime.** λ2 (1.143) is **~12% worse**
+than λ0 (1.024) on test L2. Combined with the other regimes, the world loss never beats no-world-loss:
+
+| regime | λ0 | λ2 | λ2 − λ0 |
+|---|---|---|---|
+| LoRA (e2_lora) | 0.928 | 0.927 | ~0 |
+| FT, our recipe (e2_FT) | 1.137 | 1.199 | +0.06 (worse) |
+| **FTpaper (e2_FT)** | **1.024** | **1.143** | **+0.12 (worse)** |
+
+**Is this the valid setup we were searching for?** Two answers, and they differ:
+- **As a *pipeline*: yes.** FTpaper is a faithful small-scale reproduction of the paper's *training*
+  recipe (full-FT, frozen vision, frozen DINOv3, lr 2e-5, batch 64, 2 epochs, 2 s horizon), it runs
+  cleanly, and it produces a sensible policy. It is a trustworthy testbed for future world-head ideas.
+- **As a *demonstration that the world head helps*: no.** The setup removes the "wrong
+  hyperparameters" excuse — and the null **persists** (slightly negative). So the paper's claimed
+  world-head benefit does **not** surface in a faithful *small-scale, open-loop* probe.
+
+**Honest caveats (so the negative isn't over-read):**
+- **Single seed per arm.** The earlier multi-seed run showed a λ0 **seed spread ≈ 0.40**; the 0.12
+  FTpaper gap is well inside that, so "λ2 worse" is **likely noise** — the defensible claim is *no
+  measurable benefit*, not *harm*. Needs seeds 1–2 for error bars.
+- **Slight undertraining** (eval still declining at 158 steps) and **no base/no-train reference** yet.
+- The standing scope limit stands: the paper's "remarkable" gains are **closed-loop at full scale**;
+  short-horizon **open-loop L2 at ~1% data** is the axis least sensitive to world modeling.
+
+**Conclusion for E2.** The E2 program's *engineering* goal — a faithful, working, controlled
+pipeline where each part is wired and the model trains — is **met** (FTpaper). Its *scientific*
+question — does the world head help the policy at this scale — is a **consistent null across LoRA,
+our-FT, and paper-faithful FT**. The world head's *mechanical* role works (it trains and predicts at
+~27% of scene variance); its *functional* benefit to open-loop driving is not observable here. That
+is now a clean, hyperparameter-confound-free statement, and it points the remaining explanation at
+**scale / closed-loop / a stronger world target** rather than a broken setup. Next, to firm it:
+multi-seed + base reference; then the decision of whether to pursue closed-loop/scale or a redesigned
+(harder/normalized) world objective.
