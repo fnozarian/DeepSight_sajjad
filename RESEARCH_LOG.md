@@ -1336,3 +1336,206 @@ is now a clean, hyperparameter-confound-free statement, and it points the remain
 **scale / closed-loop / a stronger world target** rather than a broken setup. Next, to firm it:
 multi-seed + base reference; then the decision of whether to pursue closed-loop/scale or a redesigned
 (harder/normalized) world objective.
+
+### FTpaper rerun at lr 2e-5 + 10 max-epochs + early stopping (the cleanest run; null holds)
+
+After fixing the LR (2e-4 → **2e-5**, the safer/standard full-FT value; the 2e-4↔batch64 pair contradicts
+LR-batch scaling) and raising `num_train_epochs` to **10** with early stopping, re-ran the FTpaper arms:
+- λ0 → `configs/ad_bev_e2_3_FTpaper_lambda0_seed0.yaml` → `saves/ad_bev_e2_3_FTpaper_lambda0_seed0/1781858883_…/`
+- λ2 → `configs/ad_bev_e2_3_FTpaper_lambda2_seed0.yaml` → `saves/ad_bev_e2_3_FTpaper_lambda2_seed0/1781858965_…/`
+
+| arm | lr | test L2 overall | best eval_loss | stopped at |
+|---|---|---|---|---|
+| FTpaper λ0 (1781858883) | 2e-5 | **0.996** | 0.337 (ckpt-220) | early-stop @ step 280 / epoch 3.55 |
+| FTpaper λ2 (1781858965) | 2e-5 | **1.006** | 0.427* | early-stop ~ same |
+
+*λ2's eval_loss includes the world-MSE term → not comparable across λ; only L2 is.
+
+**Two things this run validates (engineering goal):**
+1. **Early stopping fired correctly.** With 10 epochs of headroom, λ0's `eval_loss` bottomed at step 220
+   (0.3373) then rose for 3 evals (240→0.339, 260→0.347, 280→0.341) → patience-3 stop at 280, and
+   **`load_best_model_at_end` restored `checkpoint-220` without crashing** — confirming the
+   `save_total_limit ≥ patience+1` crash-guard end-to-end. (The earlier FT λ2 crash mode is fixed.)
+2. The full protocol (3-split, periodic eval, early stop on best, full-FT direct eval) runs clean and the
+   model generalizes (test L2 ≈ 1.0).
+
+**World-loss effect (the cleanest comparison yet):** λ2 **1.006** vs λ0 **0.996** → **Δ +0.010 — essentially
+tied** (λ2 a hair worse, deep inside the ~0.40 seed-spread noise). Compared to the lr-2e-4/2-epoch run
+(λ0 1.024, λ2 1.143, Δ +0.119), the cleaner 2e-5 + more-epochs + best-model setup both **generalizes slightly
+better** (λ0 1.024→0.996) and **shrinks the apparent λ gap to ~0** — i.e. the earlier "λ2 worse" was mostly the
+aggressive LR / few steps, not the world loss. So in the most careful paper-faithful run, **λ2 ≈ λ0**, matching
+LoRA (0.927 vs 0.928).
+
+**Can we now conclude what E2 was searching for?**
+- **Pipeline (engineering) — YES, conclusively.** We have a faithful, working, controlled small-scale
+  reproduction of the paper's training pipeline: it trains cleanly, early-stops on the best checkpoint without
+  crashing, generalizes, and every component is wired and exercised. This is the validated testbed E2 set out
+  to build — future world-head ideas can now be A/B'd through it.
+- **World-head benefit — NO measurable effect**, now a **consistent null across every regime tested**
+  (LoRA Δ≈0; paper-faithful FT at 2e-5 Δ≈+0.01). It is *not* proof the head is useless: the open-loop /
+  small-scale / short-horizon probe is the axis least sensitive to world modeling, and we still lack
+  multi-seed error bars + a base reference. So: **"no measurable open-loop benefit at this scale," confirmed
+  in the cleanest faithful setup** — the remaining honest explanations are scale / closed-loop / a stronger
+  (harder/normalized) world target, not a broken pipeline.
+
+**Docs updated alongside these runs** (so the mechanics are recorded once, in the right file): the
+`loss_rec` (training CE) vs **L2** (eval) distinction, the forward/backward pass (hidden→`lm_head`/`vis_head`
+projection, teacher forcing, the one-position label shift, what is/!isn't back-propagated), sequential
+inference (prefill + decode loop, "only the last hidden row predicts the next token", KV-cache), and the
+train/eval/test "is the GT fed to the model?" table were written into **`INPUT_FORMAT.md` §10** (verified on
+the 4540-token sample). These were intentionally placed in `INPUT_FORMAT.md` (not `SRC_CODE_MAP.md`), which
+remains the paper→code map.
+
+---
+
+### 2026-06-22 — world-head **feature collapse**: real in OUR repro, ABSENT in the released checkpoint
+
+**How we got here.** Re-examining the two cleanest runs (`1781858883_…FTpaper_lambda0_seed0`,
+`1781858965_…FTpaper_lambda2_seed0`) the loss curves looked *too* easy — eval_loss reaches ~90 % of its total
+drop within the **first epoch** and is flat after ~1.9 epochs (eff-batch 64, 5000 samples → **78 steps/epoch**;
+λ0 eval 0.43@step80→0.376@100→best 0.337@220 then rises = overfitting). That fast-convergence smell led to a
+collapse investigation of the **world head** (`vis_head` + `loss_gen`), then to checking the paper, validating
+our data, and finally probing the released checkpoint. Net result **reverses** the earlier "world loss does
+nothing" reading and **retracts** a wrong claim made during this investigation (see Retraction below).
+
+**TL;DR.** Our small-scale world head **collapses to the per-dimension mean** (`loss_gen` floor ≈ 0.042 ≈ the
+trivial baseline). The **released DeepSight checkpoint does NOT collapse** (`loss_gen` = **0.019** on the *same*
+data → ~54 % explained variance). So collapse is **not intrinsic to the unnormalized-MSE objective**; it is a
+property of our **low-diversity / few-step** regime. E2's null was therefore a test of a *collapsed* head, not of
+world modeling per se.
+
+#### Part 1 — the DINOv3-target baseline table (what each row means, how it's computed)
+
+`loss_gen = nn.MSELoss(vis_head(hidden@bev_positions), DINOv3(future_BEV))`, reduction = mean over **every**
+element. The model's collator builds `template_mask` = per 261-token DINOv3 frame, **keep CLS (pos 0) + 256
+patches (pos 5..260), drop the 4 register tokens (pos 1..4)** → 257 kept/frame. We ran the *released* model's
+frozen DINOv3 on real `e2_FT` future-BEV crops (400 frames, registers dropped) and asked: *what MSE would a
+**constant** predictor (one that ignores the scene) score, at three granularities?*
+
+| Row | What the constant predictor may know | Computation | MSE |
+|---|---|---|---|
+| predict **global scalar mean** | one number for all 400×257×1024 elements | `c=F.mean(); ((F-c)**2).mean()` = total per-element variance (`std²=0.2675²`) | **0.0716** |
+| predict **per-dim mean** | a fixed **vector** (1024), same for every scene & position | `m=F.reshape(-1,1024).mean(0); ((F-m)**2).mean()` | **0.0414** |
+| predict **per-(position,dim) mean** | a fixed **257×1024 template**, indexed by token position, still scene-blind | `t=F.mean(0); ((F-t)**2).mean()` | **0.0320** |
+| — achieved by **our FTpaper λ2** head | the actual trained model | training-log `loss_gen` plateau | **~0.042** |
+
+Reading: our head sits **on the per-dim-mean baseline** (≈5 % explained variance) and is **worse than the
+scene-blind per-position template** (0.042 > 0.032). A lookup table that ignores the input entirely would beat
+it. That is the unambiguous collapse signature. (An earlier unmasked pass on the warmstart DINOv3 gave the same
+story: 0.0734 / 0.0441 / 0.0308.)
+
+#### Part 2 — the three arguments, the tests, and the verdicts
+
+**Diagnostics on OUR runs.**
+- **`loss_gen` collapses in <1 epoch and never recovers.** Windowed mean over the λ2 run's microbatch prints:
+  16 (pre-warmup) → **0.064 by ~step 80 (1 epoch)** → crawls to **0.042** over the next ~9 epochs (last-200
+  mean 0.045, std 0.005). It flatlines, it doesn't learn.
+- **`vis_head` barely trains** (std of the 2048×1024 weight):
+
+  | checkpoint | `vis_head.weight` std | note |
+  |---|---|---|
+  | warmstart (init) | 0.0200064 | random Linear (neutral ablation; **not** the pretrained head) |
+  | λ0 trained (weight=0) | 0.0200064 | **byte-identical** to init (no gradient — expected) |
+  | λ2 trained (weight=2) | 0.0199898 | moved **0.07 %** over 648 steps |
+  | released `deepsight` | 0.0201 | different values — genuinely trained |
+
+  The loss is "minimized" through the LLM trunk emitting near-constant hidden states at bev positions, not by a
+  meaningful projection.
+
+**The paper (tex_source).**
+- **No mention of collapse / normalization / stop-grad / centering / variance / cosine** anywhere. `L_world =
+  MSE(F, F_gt)` — same plain unnormalized MSE as the code; `λ_world` never even given numerically.
+- **It does ablate the world model**, but compares *variants / on-off*, never *prediction quality*:
+  - `tab:method_comparison` (220 routes, closed-loop): **WM off→on (ID1→ID3) = +26.4 DS, +37.7 SR**, called the
+    biggest single contributor (bigger than CoT).
+  - `tab:closed_loop_ablation` (Dev 10): DINOv3 target ≫ VAE (+47 DS); 5-frame ≫ 1-frame (+11.8 DS).
+  - Crucially it **never reports `loss_gen`** or a feature-reconstruction metric — only that the *module's
+    presence* helps. (Their WM toggle flips the whole 1305-token block + head + loss together, so it can't
+    separate "predicting the future helps" from "extra register/compute tokens help".)
+
+**User's three arguments — all VALID.**
+1. *Eval-regime (closed vs open loop) can't explain no-collapse, since their **training** is also open-loop /
+   teacher-forced / same MSE.* ✅ Collapse is a **training-time** property of the objective; the eval regime is
+   irrelevant to whether the head collapses. The earlier "regime" reconciliation conflated *benefit-detectability*
+   with *collapse-occurrence* — conceded.
+2. *Huge drop in the first <1 epoch (before seeing each sample once) ⇒ data **quantity** isn't the cause.* ✅
+   Collapsing to the mean is a low-complexity statistic reachable in a few batches; the fast drop **is** the
+   collapse, not learning.
+3. *Batch size / #GPUs can't be it — grad-accum matched effective batch 64.* ✅ Grad-accum reproduces the
+   true batch-64 gradient exactly; there are no batch-coupled anti-collapse terms here (no contrastive negatives,
+   no VICReg variance, no BN). Batch 64 vs the paper's 128 doesn't flip collapse.
+
+**Data-equivalence validation (done BEFORE trusting the released-model probe).** Confirmed our preprocessing ==
+theirs for the frames we use:
+
+| Aspect | Ours | Theirs | Match |
+|---|---|---|---|
+| BEV crop geometry | `crop_bev_for_bench2drive_local.py` | `crop_bev_for_bench2drive.py` | **verbatim** (ego-motion warp, 512² crop @ top=85, hz=[0,5,10,15,20]); only I/O differs |
+| Image list | 4 hist `rgb_front` + 6 surround + 5 BEV, BEV last | `create_date_set.get_images` (L144 → `rgb_{cam}`) | **identical** count/order/folders |
+| Prompt text | `targetpointgen.get_prompt` | closed-loop agent `get_prompt` | **byte-identical** except CoT flag |
+| Answer text | `targetpointgen.get_answer` (FLAGE=False) | same module | **identical** structure |
+| BEV→DINOv3 norm | 256 resize + ImageNet mean/std (`ad_collator`) | same | **same** |
+
+Two deliberate, non-distorting deltas: CoT flag `<CoT_flag_False>` (our no-CoT arm) vs agent's hardcoded `True`
+(one token; world features predicted before CoT); and we start at frame ≥20 (real history) vs their
+`hisblack.jpg` placeholder for frames 1–19 (we're a clean subset). The Chinese-CoT `create_date_set.py` is a
+**separate/older** pipeline, *not* the released English-token format — we validated against the right one.
+
+**Decisive test — released-checkpoint `loss_gen` probe.** `configs/probe_deepsight_released.yaml`: a
+**forward-only** run (lr=0, max_steps=3, no eval/save) of `checkpoints/deepsight` through the *real* training
+stack + `ADCollator` on `e2_FT`, so the per-microbatch `loss_gen` printed by `modeling_qwen2_5_vl.py` reflects
+the released model **unchanged**. 42 microbatches: mean **0.0190**, std 0.0036, min 0.012, max 0.031.
+
+| Model (same `e2_FT` data, same `loss_gen`) | `loss_gen` | expl. var vs per-dim (0.0414) | vs per-pos (0.0320) | verdict |
+|---|---|---|---|---|
+| per-dim mean (trivial) | 0.0414 | 0 % | — | baseline |
+| per-position template (trivial) | 0.0320 | — | 0 % | baseline |
+| **our small-scale FTpaper λ2** | **0.042** | **~5 %** | **−31 % (worse)** | **collapsed** |
+| **released DeepSight** | **0.0190** | **54 %** | **41 %** | **healthy** |
+
+The published head reaches **half the MSE of predicting the mean** and beats the per-position template — it
+genuinely encodes scene structure. **Collapse is absent in their work.**
+
+#### Retraction
+
+Earlier in this investigation I argued the collapse was **intrinsic to the unnormalized-MSE objective** and that
+"scale won't add an anti-collapse term." **That is wrong.** Same objective, same frozen DINOv3, no normalization
+— and the released head learned fine (0.019). The collapse is specific to our **low-diversity, few-step**
+small-scale regime.
+
+#### Conclusions
+
+- **Mechanism.** With low-diversity targets (our 5000 mostly-straight frames) the per-dim mean is a *good*
+  solution → vanishing gradient → collapse by ~step 80. With rich/diverse targets (full Bench2Drive: turns,
+  interactions, batch 128, ~2 epochs = thousands of steps) the mean leaves large residuals everywhere → strong
+  persistent gradient → the head is forced to encode real structure. This **confirms the earlier "data
+  *diversity*, not quantity" intuition** and refines it: it's diversity that prevents collapse, not raw count.
+- **E2 reinterpreted.** The λ2≈λ0 null (LoRA Δ≈0; FTpaper Δ≈+0.01) was **not** a fair test of world modeling —
+  it measured whether a **collapsed** head helps the policy (it can't). A valid test needs a **non-collapsed**
+  head.
+- **Paper's ablation credibility restored.** Their head demonstrably learned (~54 % explained variance), so the
+  +26 DS from the WM toggle plausibly reflects real world-prediction rather than only extra register tokens —
+  though their on/off toggle still can't fully separate the two, and they never report prediction quality.
+
+#### Next steps (suggested, not yet run)
+
+1. **Reproduce a non-collapsed head locally**: rebuild `e2` with **maneuver-balanced** scenes (turns / junctions
+   / interactions over-sampled), train enough steps, and confirm `loss_gen` drops **below the per-position
+   baseline (<0.032)** before re-running the λ0/λ2 A/B. Only then is the E2 world-loss question fairly answered.
+2. **Add a collapse guard to the standard metrics**: log `loss_gen` **and** explained-variance-vs-mean during
+   every run (a head at the per-dim baseline = collapsed) so we never again mistake collapse for "no benefit".
+3. **Diagnostic eval that can see world modeling**: CE on **numeric waypoint tokens only**, and autoregressive
+   L2 split by **horizon (1s/2s)** and **maneuver (straight vs turn)** — the open-loop teacher-forced eval_loss
+   saturates on template + straight-line kinematics and is blind to the head.
+4. This also strengthens the JEPA motivation ([WORLD_MODEL_JEPA.md](WORLD_MODEL_JEPA.md)): a
+   normalized/variance-regularized target would make the head **collapse-resistant even in low-diversity
+   regimes**, decoupling "does world modeling help" from "did we feed it diverse enough data".
+
+#### Artifacts / repro
+
+- `configs/probe_deepsight_released.yaml` — forward-only (lr=0) released-checkpoint `loss_gen` probe.
+- Baseline computation (frozen DINOv3 on `e2_FT` BEV, exact register mask): per-dim 0.0414, per-pos 0.0320,
+  global 0.0716; `std=0.2675`. (Released DINOv3; warmstart DINOv3 gave consistent 0.0441 / 0.0308 / 0.0734.)
+- Storage hygiene (same day): deleted all intermediate `saves/*/*/checkpoint-*` (1.4 TB→157 GB); run-root
+  best models kept. One casualty — the **crashed** FT λ2 run `1781733356` never consolidated a root model, so
+  its weights are gone (results/logs preserved; it was the superseded non-paper 2e-4 variant).
