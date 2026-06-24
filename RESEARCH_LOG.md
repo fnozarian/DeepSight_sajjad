@@ -1642,3 +1642,92 @@ coefficients (`var=1.0, cov=0.04` may over-weight variance vs invariance).
 2. If A1 cosine is confirmed non-collapsed + better L2 → that's the first evidence a *non-collapsed* world head
    helps the policy at our scale (the real E2 question). Then add seeds for error bars.
 3. Re-tune vicreg (raise invariance weight / lower `world_var_coeff`) so variance is target-aligned, not free.
+
+#### E2-4 A3 — the DATA-DIVERSITY arm (A3, deferred from E2-4): attack collapse with scale/diversity, not the objective
+
+Complementary to the E2-4 objective fixes (A1/A2): instead of changing the loss, keep the **original plain MSE**
+and ask whether the collapse is simply a **low-diversity** artifact. The released checkpoint reaches EV=54% on
+the full diverse Bench2Drive; our collapsing e2_FT used only **211 train scenes × ~25 frames**. So we built a
+MAX-diversity dataset that mirrors the released regime as closely as the local data allows.
+
+**Data (`local_data/e2_4_A3/`, built 2026-06-23):**
+- **TRAIN 20000 = 2 frames × 10000 scenes** from `bench2drive_full` (47× the scene-diversity of e2_FT).
+- **EVAL 500 / TEST 499** = 1 frame each from **disjoint** `bench2drive_base` scenes.
+- `full ∩ base` is empty (verified), so train is disjoint from eval/test by construction; scene+sample
+  disjointness asserted in-builder **and** re-checked with `comm -12` (train∩eval = train∩test = eval∩test = 0).
+- Scene lists split out for clarity: `ready_scenes.txt` → renamed `ready_scenes_base.txt` (999 base scenes);
+  new `ready_scenes_full.txt` (13804 extracted full scenes).
+
+**Fast builder (`scripts/build_e2_4_A3.py`).** The canonical `build_local_train_jsonl.build_scene` reads ALL
+~300-800 gzipped annos/scene (~18 s/scene) just to extract a couple frames. The new builder reads ONLY the
+needed annos — the 9 frames `parse_anno` touches per target (i±5,10,15,20) + a subsampled route (`--route-step`,
+command points are piecewise-constant → near-lossless after dedup) — **3.5 s/scene cold (~5×)**, GT waypoints +
+image lists **byte-identical** to canonical (verified). NFS is the wall (~3 scenes/s even at 64 workers), so the
+20000-sample build took ~50 min.
+
+**Config (`configs/ad_bev_e2_4_A3_lambda2_seed0.yaml`).** Same recipe as the E2-4 A0 control — full-FT, lr 2e-5,
+vision+DINOv3 frozen, **`world_loss_type: mse`** (so `probe_world_collapse.py`'s raw-MSE EV stays a VALID meter)
+— on **4 GPUs**, effective batch 64 (`per_device 1 × 4 GPU × accum 16`), `num_train_epochs: 4`. End-to-end
+validated on 4 GPUs (train→save→load→generate→L2 all run; smoke L2 parsed 6/6).
+- *Batch-size aside:* tried `per_device 3 / accum 6` (eff 72) for speed; measured **only ~1.2× throughput**
+  (35→33 s/it at eff 64→72), because the workload is **compute-bound** (~4600-token sequence + 10 images on a
+  3B model already saturates the GPU at batch-1 → per-micro time scales ~linearly with batch). Reverted to
+  `per_device 1 / accum 16` to stay comparable (eff-batch 64) with the other E2 runs.
+
+**Prediction / decision rule.** Train, then `probe_world_collapse.py --data-dir local_data/e2_4_A3`. If EV
+jumps from e2_FT's ~5% toward the released ~54%, **scene diversity (not the objective) is the collapse cause** —
+and it would mean our earlier null/collapse was a small-data artifact, not a flaw in the DINOv3-MSE world loss.
+If EV stays ~5% despite 47× the diversity, the objective itself is implicated (strengthening the A1/A2 / JEPA
+direction). Either outcome is decisive. **Status:** dataset built + config validated; training launched
+(`saves/ad_bev_e2_4_A3_lambda2_seed0/`), meter pending its completion.
+
+---
+
+### 2026-06-24 — E2-4 A3 result: DIVERSITY (not the objective) was the cause — collapse mostly cured
+
+Run `1782231563_ad_bev_e2_4_A3_lambda2_seed0` finished (full-FT, lr 2e-5, eff-batch 64, **plain MSE**, 20000
+samples / 10000 scenes; eval_loss bottomed 0.387 @ step 900 then rose → early-stopped on best).
+
+**Collapse meter — the headline.** Same `probe_world_collapse.py` (raw-MSE EV), run on the e2_4_A3 data:
+
+| training data | train scenes | raw `loss_gen` | EV vs per-dim | EV vs per-pos | verdict |
+|---|---|---|---|---|---|
+| e2_FT (small) | 211 | 0.042 | ~5 % | **−31 %** (worse than template) | **COLLAPSED** |
+| **e2_4_A3 (this run)** | **10000** | **0.0304** | **37.7 %** | **+27.1 %** | **PARTIAL (near-healthy)** |
+| released DeepSight | full (~13.8k+, many frames) | 0.019 | 54 % | (beats template) | HEALTHY |
+
+(EV computed against this dataset's own DINOv3 baselines: std 0.271, per-dim 0.0488, per-pos 0.0417.)
+
+**Answers to the questions posed:**
+- **Does it still collapse? NO — largely cured.** EV jumped **~5 % → 37.7 %** just by going from 211 → 10000
+  train scenes, *with the exact same objective and recipe*. Crucially it now **beats the per-position template**
+  (+27 % vs e2_FT's −31 %), i.e. the head encodes genuine *scene-specific* structure, not a fixed lookup. It's
+  "PARTIAL" (just under the 40 % healthy bar) — consistent with using only 2 frames/scene and less total data
+  than the released full-scale training. There is a clean monotonic trend: **211 → 10000 → full scenes ⇒ EV
+  5 % → 38 % → 54 %.** This **confirms the diversity hypothesis**: the collapse was a small-data artifact, NOT a
+  flaw in the DINOv3-MSE world objective. (Retraction-of-retraction: the objective is fine *given enough scene
+  diversity* — exactly what the released-checkpoint probe implied.)
+- **Are the numbers more reliable now?** Yes, in the meaningful sense: the world head is doing real work (not a
+  degenerate constant), and eval is over 499 *distinct* scenes (broad), so eval_loss/L2 reflect genuine
+  generalization rather than a memorized template. (Stat caveat unchanged: still single-seed.)
+- **Better L2?** Yes, large drop: **overall 0.634 (1s 0.399, 2s 0.870)** vs e2_FT's ~0.996–1.006. **Caveat:** the
+  e2_4_A3 test set (499 distinct base scenes × 1 frame) ≠ the e2_FT test set, so this is not strictly
+  apples-to-apples — though both are 2 s base-scene L2, and the more-diverse test is if anything *harder*, which
+  makes the improvement credible. A same-test cross-eval would nail it down.
+- **Does world modeling help the model learn more?** The world loss is now a **live, non-degenerate learning
+  signal** (38 % EV) instead of a constant it satisfies trivially — so yes, the world-modeling pathway is
+  actually functioning here, which it was not at small scale.
+- **Is the world head *helping the policy* (trajectory)?** **Not yet answerable from this run alone.** This is a
+  single λ_world=2 run; the better L2 could come from the diverse data itself, independent of the world loss. To
+  isolate it we need the matched **λ_world=0** run on e2_4_A3 (world head off, everything else identical) and
+  compare L2. That is the clean next experiment — and now it is finally a *fair* test, because the head no
+  longer collapses.
+
+**Meter fix (same day):** `probe_world_collapse.py` was wastefully tokenizing the entire 20000-sample train set
+before its 3 forward steps (LLaMA-Factory preprocesses the registered dataset up front). Added `max_samples: 512`
+to the throwaway probe config so it only tokenizes a few hundred samples → meter now runs in minutes on big
+datasets. (Also cleaned up overlapping/zombie probe runs that had confused timing.)
+
+**Next:** run `ad_bev_e2_4_A3` with `world_loss_weight: 0` (λ0) — the matched no-world-loss control — then
+compare L2 (λ2 0.634 vs λ0) on the *same* e2_4_A3 test to finally answer "does the (now non-collapsed) world
+head improve the trajectory?". Optionally add seeds + a same-test cross-eval vs the e2_FT models.
