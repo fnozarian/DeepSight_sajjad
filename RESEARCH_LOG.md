@@ -718,16 +718,16 @@ The E2 ablation is now fully set up and ready to run (results to be discussed in
   [110:155]) → verified **0 sample overlap**. More data + a genuinely unseen, diverse held-out
   set = lower-variance, generalization-measuring L2 (the right signal for the λ ablation).
 
-**Auto-eval** (`scripts/train.sh --eval <heldout.jsonl>`): after training, the wrapper runs
+**Auto-eval** (`scripts/train.sh --test <heldout.jsonl>`): after training, the wrapper runs
 inference with the just-saved checkpoint on the held-out set + `eval_l2.py`, writing results
-**into the run dir** (`saves/<arm>/<unixtime>_<arm>/`: `heldout_infer.json`, `eval_plots/`,
-`eval.log`) — not `debug/`. (`src/infer_local_multi_gpu.py` auto-shards across the visible GPUs.)
+**into the run dir** (`saves/<arm>/<unixtime>_<arm>/`: `test_infer.json`, `test_plots/`,
+`test.log`) — not `debug/`. (`src/infer_local_multi_gpu.py` auto-shards across the visible GPUs.)
 
 **Launch (per arm; multi-GPU needs the ZeRO override):**
 ```
 CUDA_VISIBLE_DEVICES=0,1,2 FORCE_TORCHRUN=1 scripts/train.sh \
     configs/ad_bev_overfit_lambda2_randinit.yaml \
-    --eval local_data/e2_overfit_lambda/heldout_infer.jsonl \
+    --test local_data/e2_overfit_lambda/heldout_infer.jsonl \
     deepspeed=examples/deepspeed/ds_z2_config.json
 ```
 **Estimated cost (3 GPUs, ZeRO-2):** ~1.5–1.7 h training + ~14 min eval per arm → ~7–8 h for
@@ -739,7 +739,7 @@ world loss helps the policy (JEPA upgrades a working component); tie ⇒ decorat
 ### E2 RESULTS (4 arms): world loss helps in the competent regime, inconclusive from scratch
 
 All 4 arms ran with auto-eval. Train losses from `run.log`; held-out L2 (500 unseen samples)
-from `eval.log` (`ALL SCENES`).
+from `test.log` (`ALL SCENES`).
 
 | Sub-exp / arm | train `loss_rec` (last-50) | train `loss_gen` (last-50) | held-out L2 1s | 2s | **avg** | parsed |
 |---|---|---|---|---|---|---|
@@ -912,10 +912,10 @@ model); `seed: <0|1>`. DINOv3 stays frozen as in the released recipe (it is a ta
 
 **Run + eval (fixed protocol, unchanged tooling).** Per arm:
 `CUDA_VISIBLE_DEVICES=0,1,2 FORCE_TORCHRUN=1 scripts/train.sh configs/ad_bev_e2_3_lambdaX_seedY.yaml
-deepspeed=examples/deepspeed/ds_z2_config.json --eval local_data/e2_overfit_lambda/heldout_infer.jsonl`
+deepspeed=examples/deepspeed/ds_z2_config.json --test local_data/e2_overfit_lambda/heldout_infer.jsonl`
 — ZeRO-2 is mandatory (3B full-finetune DDP OOMs, learned in E1). `train.sh` already produces the
 timestamped run dir, `run.log`, 3-loss plot, and the held-out open-loop L2 in the same dir. The
-`base` reference is the same `--eval` path pointed at `checkpoints/deepsight_warmstart` with no
+`base` reference is the same `--test` path pointed at `checkpoints/deepsight_warmstart` with no
 training (or `src/infer_local_multi_gpu.py` directly).
 
 **Resource / time estimate.** Same data and schedule as E2 (2000×2 epochs on 3 GPUs), so each arm
@@ -1019,7 +1019,7 @@ config file is passed — verified end-to-end; the merged ckpt contains the full
 **Status: IMPLEMENTED — sweep running.** Done: warm-start init built + smoke-verified; 4 LoRA
 configs written; `train.sh` merge-before-eval added & verified; all three regimes (full-FT randinit,
 full-FT warmstart, LoRA) smoke-passed end-to-end through `train.sh`; `e2_lora` (5k/1k) built. Run:
-`scripts/train.sh configs/ad_bev_e2_3_LORA_lambda{0,2}_seed{0,1}.yaml --eval local_data/e2_lora/heldout_lora.jsonl`
+`scripts/train.sh configs/ad_bev_e2_3_LORA_lambda{0,2}_seed{0,1}.yaml --test local_data/e2_lora/heldout_lora.jsonl`
 (one GPU each; launch run #1 first so it builds the shared cache, then the rest). `base` reference =
 `deepsight_warmstart` evaluated with no training. Results → tabulated under a later log entry vs the
 pre-registered decision rule.
@@ -1277,7 +1277,7 @@ The above used *our* recipe (lr 1e-4, trained vision tower, etc.), not the paper
   improving, so it correctly never fired.)
 - **Data factorization:** each dataset dir now holds `train.jsonl` / `eval.jsonl` / `test.jsonl`
   (type implied by the parent dir, e.g. `e2_lora`, `e2_FT`); `dataset_dir` alone selects all three
-  (train+eval via the registry, test via `train.sh`'s `--eval` → `<dataset_dir>/test.jsonl`). The
+  (train+eval via the registry, test via `train.sh`'s `--test` → `<dataset_dir>/test.jsonl`). The
   eval output was renamed `heldout_infer.json` → **`test_infer.json`**.
 
 ### 2026-06-19 — FTpaper results: the pipeline is VALID; the world head still shows no benefit
@@ -1694,7 +1694,7 @@ samples / 10000 scenes; eval_loss bottomed 0.387 @ step 900 then rose → early-
 |---|---|---|---|---|---|
 | e2_FT (small) | 211 | 0.042 | ~5 % | **−31 %** (worse than template) | **COLLAPSED** |
 | **e2_4_A3 (this run)** | **10000** | **0.0304** | **37.7 %** | **+27.1 %** | **PARTIAL (near-healthy)** |
-| released DeepSight | full (~13.8k+, many frames) | 0.019 | 54 % | (beats template) | HEALTHY |
+| released DeepSight | full (~13.8k+, many frames) | 0.019 | 54 % | **+41 %** | HEALTHY |
 
 (EV computed against this dataset's own DINOv3 baselines: std 0.271, per-dim 0.0488, per-pos 0.0417.)
 
@@ -1731,3 +1731,99 @@ datasets. (Also cleaned up overlapping/zombie probe runs that had confused timin
 **Next:** run `ad_bev_e2_4_A3` with `world_loss_weight: 0` (λ0) — the matched no-world-loss control — then
 compare L2 (λ2 0.634 vs λ0) on the *same* e2_4_A3 test to finally answer "does the (now non-collapsed) world
 head improve the trajectory?". Optionally add seeds + a same-test cross-eval vs the e2_FT models.
+
+#### Infrastructure changes for the world-head trajectory ablation (A3 λ0 vs λ2)
+
+To run the "does the world head help the policy?" test cleanly, several files were renamed/added (the E2-TF-big
+work was promoted into the E2-4 A-arm family as **A3 = data-diversity**):
+
+- **Renamed E2-TF-big → E2-4 A3** everywhere (configs, data dir, builder, save dir, log refs):
+  `local_data/e2_TF_big` → `local_data/e2_4_A3`; `scripts/build_e2_tf_big.py` → `scripts/build_e2_4_A3.py`;
+  `configs/ad_bev_e2_TF_big_mse_seed0.yaml` → `configs/ad_bev_e2_4_A3_lambda2_seed0.yaml` (and its save dir +
+  run dir). The completed diverse run (EV 37.7 %, L2 0.634) is the **λ2** arm under the new name.
+- **Added the λ0 control — `configs/ad_bev_e2_4_A3_lambda0_seed0.yaml`** (THIS is the new ablation knob):
+  byte-identical to the λ2 config except **`world_loss_weight: 0.0`** (DINOv3 world loss off → `vis_head` gets
+  no gradient; total `loss == loss_rec`, verified in smoke). Same data (`e2_4_A3`), same recipe (full-FT, lr
+  2e-5, eff-batch 64, vision+DINOv3 frozen, plain MSE). **The λ0-vs-λ2 L2 gap on the same `e2_4_A3/test.jsonl`
+  is the answer to "does the world head help the trajectory?"** — and it is now a *fair* test, because at this
+  diversity the head no longer collapses. λ0's `collapse.log` is expected to read ~collapsed (head untrained).
+- **`--eval` → `--test` flag rename** (consistency: the *eval-set* during training keeps `eval_*`; the final
+  *test-set* L2 is now `--test`). Renamed in `scripts/train.sh` (wrapper flag) and
+  `src/infer_local_multi_gpu.py` (its `--eval`→`--test`, `args.test`), plus all config launch-comments and the
+  runbooks/log command examples. Upstream `src/transformers/**` and `src/dinov3/**` `--eval*` flags left as-is.
+- **Test-eval artifacts renamed** `eval.log`→`test.log`, `eval_plots/`→`test_plots/` across `train.sh`, the
+  runbooks, old log entries, and all 19 existing run dirs (disambiguates the intermediate eval-set from the
+  final test-set L2; `test_infer.json` was already so named).
+- **`train.sh` now auto-runs the collapse meter** after the L2 test eval (also under `--test`): it calls
+  `scripts/probe_world_collapse.py` on the same best model and writes the EV verdict to **`collapse.log`** in
+  the run dir — so every `--test` run reports BOTH `test.log` (trajectory L2) and `collapse.log` (world-head EV)
+  with no manual step. End-to-end validated on a kept smoke run (`saves/_smoke_test_pipeline/…`): saved model +
+  `test.log` (L2 0.931, 6 samples) + `collapse.log` (EV 35.6 %, PARTIAL).
+- **Meter fixes:** `probe_world_collapse.py` gained `max_samples: 512` (only tokenize a few hundred samples
+  instead of the full 20000-train set — was the cause of the ~30-min stalls) and a PID-unique temp dir
+  (`_probe_collapse_tmp_<pid>`) so concurrent auto-runs don't collide. Released-row per-pos EV filled in as
+  **+41 %** (= 1 − 0.019/0.0320) in the table above.
+
+**Known meter caveat (logged for later):** the collapse baseline is computed on the *first* 80 samples of
+`train.jsonl` (file order, no shuffle) while the model's `loss_gen` is a *shuffled* ~48-sample subset — so the
+EV numerator/denominator come from different (and, for low-diversity-ordered data, possibly few-scene) sample
+sets. Unbiased but noisy; the clean fix is to disable the probe's dataloader shuffle and compute the baseline on
+the same explicit first-K samples (or just shuffle + raise `--n-baseline`). Not yet applied.
+
+---
+
+### 2026-06-25 — E2 CONCLUSION: the world head helps the trajectory — but only once it stops collapsing
+
+The A3 ablation is complete: both arms trained on the SAME max-diversity data (`e2_4_A3`, 10000 scenes), SAME
+recipe (full-FT, lr 2e-5, eff-batch 64, vision+DINOv3 frozen, plain MSE), differing ONLY in `world_loss_weight`:
+- **λ2 (world head ON)** `1782231563_ad_bev_e2_4_A3_lambda2_seed0`
+- **λ0 (world head OFF)** `1782309767_ad_bev_e2_4_A3_lambda0_seed0` (the matched control)
+
+| arm | world head | test L2 1s | 2s | **overall** | collapse meter |
+|---|---|---|---|---|---|
+| λ0 (OFF) | no gradient → random `vis_head` | 0.433 | 0.929 | **0.681** | `loss_gen` 3.88, EV ≪0 → COLLAPSED (untrained head) |
+| **λ2 (ON)** | trained | 0.399 | 0.870 | **0.634** | `loss_gen` 0.030, **EV 37.7 %** → PARTIAL (head learned) |
+
+**Paired per-sample comparison (same 499 test samples, λ0−λ2, >0 ⇒ λ2 better):**
+
+| horizon | paired Δ | SE | t | read |
+|---|---|---|---|---|
+| 1 s | +0.0345 | 0.0114 | **+3.04** | λ2 better, p<0.01 |
+| 2 s | +0.0596 | 0.0263 | **+2.26** | λ2 better, p<0.05 |
+| overall | +0.0471 | 0.0181 | **+2.59** | λ2 better, p<0.01 |
+
+**Verdict: with the world head ON, the trajectory is significantly better at BOTH horizons** (paired t = 3.0 /
+2.3 / 2.6). The pairing matters: unpaired the gap is only ~1 SE, but per-sample (removing between-scene
+variance) it is a consistent, significant improvement. So — *for the first time in E2* — **the (non-collapsed)
+world head measurably helps the policy.**
+
+**Why this resolves the whole E2 arc.** The earlier null was an artifact of collapse, not evidence against world
+modeling:
+- **E2-3 (small data, 211 scenes):** λ2 ≈ λ0, "world loss does nothing." But the head was COLLAPSED (EV ~5 %,
+  worse than a fixed template) → it was never doing world modeling, so of course it couldn't help. *Unfair test.*
+- **E2-4 A1/A2 (cosine/vicreg objective fixes on small data):** inconclusive — the raw-MSE meter is blind to
+  scale-free/trade-off objectives.
+- **E2-4 A3 (diversity fix, plain MSE):** diversity un-collapses the head (EV 5 %→38 %, 2026-06-24) AND now the
+  world loss buys a real, significant trajectory gain (this entry). The λ0 control confirms the mechanism: with
+  the world loss off the head stays random (`loss_gen` 3.88, EV ≪0) and L2 is worse.
+
+**The unifying conclusion:** *the DINOv3 world-model head helps the trajectory IFF it is given enough scene
+diversity to actually learn (escape the per-dim-mean collapse).* At small scale it collapses and is inert
+(E2-3's null); at high diversity it learns real future-BEV structure and provides a small-but-significant
+open-loop L2 improvement (~0.047 overall, ~7 %). This is *directionally consistent* with the paper's headline
+claim that the world model helps — while exposing the precondition the paper never isolated (data/scene
+diversity, without which the same objective silently collapses).
+
+**Caveats (honest scope of the claim).**
+- **Single seed per arm.** The paired t-test controls for test-sample variance but not run-to-run (init /
+  data-order) variance; two arms differ significantly *as trained*, but robustness needs 2–3 seeds per arm.
+- **Open-loop L2 only** — the least sensitive axis; the paper's effect is closed-loop (+26 DS). A ~7 % open-loop
+  gain is consistent with a meaningful effect but is not closed-loop proof.
+- **Magnitude is modest** (~0.047 m overall). Useful as a clean existence proof ("a working head helps"), not a
+  SOTA-scale result — expected, since we use 2 frames/scene and far less data than the released full-scale run
+  (which reaches EV 54 %, vs our 38 %).
+
+**Next (to harden):** add seeds 1–2 per A3 arm for run-to-run error bars; optionally push diversity/frames toward
+the released regime (EV→54 %) to see if the L2 gain grows with EV; longer-horizon / turn-subset L2; and
+eventually a closed-loop check. This closes the E2 line: the world objective is sound and *helps when it learns*;
+the open problem is making it learn reliably at smaller scale (→ the JEPA / normalized-target direction).
