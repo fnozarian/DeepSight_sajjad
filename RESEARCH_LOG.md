@@ -1544,14 +1544,14 @@ small-scale regime.
 
 ### Cont. — E2-4 designed & implemented: detect + prevent world-head collapse
 
-Direct follow-on to the collapse finding. Goal: (1) a permanent **collapse meter**, and (2) **objective-level
+Direct follow-on to the collapse finding. Goal: (1) a permanent **variance check**, and (2) **objective-level
 prevention** tested cleanly on the *same* collapse-inducing small data, so any lift is a design fix not a
 data fix. Scope chosen: **A1 (cosine) + A2 (VICReg) on fixed data** (data-diversity arm A3 deferred).
 
-**Component 1 — collapse meter (the "check").** `scripts/probe_world_collapse.py`: wraps the validated
+**Component 1 — variance check (the "check").** `scripts/variance_check.py`: wraps the validated
 forward-only probe (lr=0, `world_loss_type=mse` forced so it always reads RAW MSE), greps `loss_gen`, computes
 the DINOv3 baselines with the exact register mask, and prints **EV = 1 − loss_gen / MSE_perdim** plus
-EV-vs-per-pos. Verdict bands (from the 2026-06-22 measurements): **EV ≤ 10 % = COLLAPSED** (ours ~5 %),
+EV-vs-per-pos. Verdict bands (from the 2026-06-22 measurements): **EV ≤ 10 % = LOW-VARIANCE** (ours ~5 %),
 **EV ≥ 40 % = HEALTHY** (released 54 %). Objective-agnostic, so A0/A1/A2 are directly comparable.
 
 **Component 2 — prevention, config-driven.** New knob `world_loss_type ∈ {mse, cosine, vicreg}` (+
@@ -1585,7 +1585,7 @@ recipe (lr 2e-5, eff-batch 64, full-FT, vision+DINOv3 frozen, e2_FT, warmstart),
 head** — the first *fair* test of "does world modeling help the policy," now possible because the head learns.
 
 **Status:** infra complete & validated; the three arms are **not yet trained**. Next: run A1+A2 (reuse A0 from
-`1781858965`), then `probe_world_collapse.py` on each, tabulate EV + L2.
+`1781858965`), then `variance_check.py` on each, tabulate EV + L2.
 
 ---
 
@@ -1614,7 +1614,7 @@ is marginal (within noise). Single seed ⇒ suggestive, not conclusive. NB: cros
 comparable (A1 ~0.84, A2 ~0.48, A0 ~0.34) because `eval_loss = loss_rec + 2·loss_gen` and `loss_gen` is in
 different units per objective — only L2 and a scale-invariant collapse metric compare across arms.
 
-**Collapse meter (`probe_world_collapse.py`, raw-MSE EV vs per-dim baseline 0.0414) — and its blind spot:**
+**Collapse meter (`variance_check.py`, raw-MSE EV vs per-dim baseline 0.0414) — and its blind spot:**
 
 | Arm | raw MSE `loss_gen` | EV vs per-dim | meter says |
 |---|---|---|---|
@@ -1666,7 +1666,7 @@ image lists **byte-identical** to canonical (verified). NFS is the wall (~3 scen
 20000-sample build took ~50 min.
 
 **Config (`configs/ad_bev_e2_4_A3_lambda2_seed0.yaml`).** Same recipe as the E2-4 A0 control — full-FT, lr 2e-5,
-vision+DINOv3 frozen, **`world_loss_type: mse`** (so `probe_world_collapse.py`'s raw-MSE EV stays a VALID meter)
+vision+DINOv3 frozen, **`world_loss_type: mse`** (so `variance_check.py`'s raw-MSE EV stays a VALID meter)
 — on **4 GPUs**, effective batch 64 (`per_device 1 × 4 GPU × accum 16`), `num_train_epochs: 4`. End-to-end
 validated on 4 GPUs (train→save→load→generate→L2 all run; smoke L2 parsed 6/6).
 - *Batch-size aside:* tried `per_device 3 / accum 6` (eff 72) for speed; measured **only ~1.2× throughput**
@@ -1674,7 +1674,7 @@ validated on 4 GPUs (train→save→load→generate→L2 all run; smoke L2 parse
   3B model already saturates the GPU at batch-1 → per-micro time scales ~linearly with batch). Reverted to
   `per_device 1 / accum 16` to stay comparable (eff-batch 64) with the other E2 runs.
 
-**Prediction / decision rule.** Train, then `probe_world_collapse.py --data-dir local_data/e2_4_A3`. If EV
+**Prediction / decision rule.** Train, then `variance_check.py --data-dir local_data/e2_4_A3`. If EV
 jumps from e2_FT's ~5% toward the released ~54%, **scene diversity (not the objective) is the collapse cause** —
 and it would mean our earlier null/collapse was a small-data artifact, not a flaw in the DINOv3-MSE world loss.
 If EV stays ~5% despite 47× the diversity, the objective itself is implicated (strengthening the A1/A2 / JEPA
@@ -1688,11 +1688,11 @@ direction). Either outcome is decisive. **Status:** dataset built + config valid
 Run `1782231563_ad_bev_e2_4_A3_lambda2_seed0` finished (full-FT, lr 2e-5, eff-batch 64, **plain MSE**, 20000
 samples / 10000 scenes; eval_loss bottomed 0.387 @ step 900 then rose → early-stopped on best).
 
-**Collapse meter — the headline.** Same `probe_world_collapse.py` (raw-MSE EV), run on the e2_4_A3 data:
+**Collapse meter — the headline.** Same `variance_check.py` (raw-MSE EV), run on the e2_4_A3 data:
 
 | training data | train scenes | raw `loss_gen` | EV vs per-dim | EV vs per-pos | verdict |
 |---|---|---|---|---|---|
-| e2_FT (small) | 211 | 0.042 | ~5 % | **−31 %** (worse than template) | **COLLAPSED** |
+| e2_FT (small) | 211 | 0.042 | ~5 % | **−31 %** (worse than template) | **LOW-VARIANCE** |
 | **e2_4_A3 (this run)** | **10000** | **0.0304** | **37.7 %** | **+27.1 %** | **PARTIAL (near-healthy)** |
 | released DeepSight | full (~13.8k+, many frames) | 0.019 | 54 % | **+41 %** | HEALTHY |
 
@@ -1723,7 +1723,7 @@ samples / 10000 scenes; eval_loss bottomed 0.387 @ step 900 then rose → early-
   compare L2. That is the clean next experiment — and now it is finally a *fair* test, because the head no
   longer collapses.
 
-**Meter fix (same day):** `probe_world_collapse.py` was wastefully tokenizing the entire 20000-sample train set
+**Meter fix (same day):** `variance_check.py` was wastefully tokenizing the entire 20000-sample train set
 before its 3 forward steps (LLaMA-Factory preprocesses the registered dataset up front). Added `max_samples: 512`
 to the throwaway probe config so it only tokenizes a few hundred samples → meter now runs in minutes on big
 datasets. (Also cleaned up overlapping/zombie probe runs that had confused timing.)
@@ -1746,7 +1746,7 @@ work was promoted into the E2-4 A-arm family as **A3 = data-diversity**):
   no gradient; total `loss == loss_rec`, verified in smoke). Same data (`e2_4_A3`), same recipe (full-FT, lr
   2e-5, eff-batch 64, vision+DINOv3 frozen, plain MSE). **The λ0-vs-λ2 L2 gap on the same `e2_4_A3/test.jsonl`
   is the answer to "does the world head help the trajectory?"** — and it is now a *fair* test, because at this
-  diversity the head no longer collapses. λ0's `collapse.log` is expected to read ~collapsed (head untrained).
+  diversity the head no longer collapses. λ0's `variance_check.log` is expected to read ~collapsed (head untrained).
 - **`--eval` → `--test` flag rename** (consistency: the *eval-set* during training keeps `eval_*`; the final
   *test-set* L2 is now `--test`). Renamed in `scripts/train.sh` (wrapper flag) and
   `src/infer_local_multi_gpu.py` (its `--eval`→`--test`, `args.test`), plus all config launch-comments and the
@@ -1754,12 +1754,12 @@ work was promoted into the E2-4 A-arm family as **A3 = data-diversity**):
 - **Test-eval artifacts renamed** `eval.log`→`test.log`, `eval_plots/`→`test_plots/` across `train.sh`, the
   runbooks, old log entries, and all 19 existing run dirs (disambiguates the intermediate eval-set from the
   final test-set L2; `test_infer.json` was already so named).
-- **`train.sh` now auto-runs the collapse meter** after the L2 test eval (also under `--test`): it calls
-  `scripts/probe_world_collapse.py` on the same best model and writes the EV verdict to **`collapse.log`** in
-  the run dir — so every `--test` run reports BOTH `test.log` (trajectory L2) and `collapse.log` (world-head EV)
+- **`train.sh` now auto-runs the variance check** after the L2 test eval (also under `--test`): it calls
+  `scripts/variance_check.py` on the same best model and writes the EV verdict to **`variance_check.log`** in
+  the run dir — so every `--test` run reports BOTH `test.log` (trajectory L2) and `variance_check.log` (world-head EV)
   with no manual step. End-to-end validated on a kept smoke run (`saves/_smoke_test_pipeline/…`): saved model +
-  `test.log` (L2 0.931, 6 samples) + `collapse.log` (EV 35.6 %, PARTIAL).
-- **Meter fixes:** `probe_world_collapse.py` gained `max_samples: 512` (only tokenize a few hundred samples
+  `test.log` (L2 0.931, 6 samples) + `variance_check.log` (EV 35.6 %, PARTIAL).
+- **Meter fixes:** `variance_check.py` gained `max_samples: 512` (only tokenize a few hundred samples
   instead of the full 20000-train set — was the cause of the ~30-min stalls) and a PID-unique temp dir
   (`_probe_collapse_tmp_<pid>`) so concurrent auto-runs don't collide. Released-row per-pos EV filled in as
   **+41 %** (= 1 − 0.019/0.0320) in the table above.
@@ -1779,9 +1779,9 @@ recipe (full-FT, lr 2e-5, eff-batch 64, vision+DINOv3 frozen, plain MSE), differ
 - **λ2 (world head ON)** `1782231563_ad_bev_e2_4_A3_lambda2_seed0`
 - **λ0 (world head OFF)** `1782309767_ad_bev_e2_4_A3_lambda0_seed0` (the matched control)
 
-| arm | world head | test L2 1s | 2s | **overall** | collapse meter |
+| arm | world head | test L2 1s | 2s | **overall** | variance check |
 |---|---|---|---|---|---|
-| λ0 (OFF) | no gradient → random `vis_head` | 0.433 | 0.929 | **0.681** | `loss_gen` 3.88, EV ≪0 → COLLAPSED (untrained head) |
+| λ0 (OFF) | no gradient → random `vis_head` | 0.433 | 0.929 | **0.681** | `loss_gen` 3.88, EV ≪0 → LOW-VARIANCE (untrained head) |
 | **λ2 (ON)** | trained | 0.399 | 0.870 | **0.634** | `loss_gen` 0.030, **EV 37.7 %** → PARTIAL (head learned) |
 
 **Paired per-sample comparison (same 499 test samples, λ0−λ2, >0 ⇒ λ2 better):**
@@ -1799,7 +1799,7 @@ world head measurably helps the policy.**
 
 **Why this resolves the whole E2 arc.** The earlier null was an artifact of collapse, not evidence against world
 modeling:
-- **E2-3 (small data, 211 scenes):** λ2 ≈ λ0, "world loss does nothing." But the head was COLLAPSED (EV ~5 %,
+- **E2-3 (small data, 211 scenes):** λ2 ≈ λ0, "world loss does nothing." But the head was LOW-VARIANCE (EV ~5 %,
   worse than a fixed template) → it was never doing world modeling, so of course it couldn't help. *Unfair test.*
 - **E2-4 A1/A2 (cosine/vicreg objective fixes on small data):** inconclusive — the raw-MSE meter is blind to
   scale-free/trade-off objectives.
@@ -1842,7 +1842,7 @@ Solving one does not solve the other. Two facts drive the ordering:
   AND closed-loop eval, so removing the god-eye target can't be *rewarded* here until real data (nuScenes/Waymo)
   is in play.
 
-**Step 1 — Build a scale-invariant collapse meter (UNBLOCKER, cheap).** The current `probe_world_collapse.py`
+**Step 1 — Build a scale-invariant variance check (UNBLOCKER, cheap).** The current `variance_check.py`
 reads raw-MSE EV, which is *meaningless* for cosine/vicreg-trained heads (A1 read −26743 %). Add **cosine-EV**
 (1 − cos_loss / mean-direction baseline) and/or **cross-scene CKA** (scale/rotation-invariant), via an embedding
 dump of `vis_head` predictions + DINOv3 targets. Without this, every anti-collapse experiment below is
@@ -1875,8 +1875,8 @@ re-run separately) — see the caveat below.
 
 | run | world head | collapse `loss_gen` / EV | test L2 (1s / 2s / overall) |
 |---|---|---|---|
-| λ0 seed0 (`1782309767`) | OFF | 3.88 / **EV ≪0** → COLLAPSED | 0.433 / 0.929 / **0.681** |
-| λ0 seed1 (`1782385423`) | OFF | 4.79 / **EV ≪0** → COLLAPSED | 0.417 / 0.910 / **0.663** |
+| λ0 seed0 (`1782309767`) | OFF | 3.88 / **EV ≪0** → LOW-VARIANCE | 0.433 / 0.929 / **0.681** |
+| λ0 seed1 (`1782385423`) | OFF | 4.79 / **EV ≪0** → LOW-VARIANCE | 0.417 / 0.910 / **0.663** |
 | λ2 seed0 (`1782231563`) | ON  | 0.030 / **EV 37.7 %** → PARTIAL | 0.399 / 0.870 / **0.634** |
 | λ2 seed1 (`1782385098`) | ON  | 0.031 / **EV 37.1 %** → PARTIAL | 0.425 / 0.915 / **0.670** |
 
@@ -1914,7 +1914,7 @@ the benefit is **within run-to-run noise** — it appears in one seed and vanish
 
 **Implication for the roadmap.** This *strengthens* the case for the planned next steps: the current
 frozen-DINOv3 objective learns but its policy payoff is marginal/noisy in open-loop, which is more reason to
-(a) get a **scale-invariant collapse meter** and a **more sensitive eval** (turn-subset / longer-horizon /
+(a) get a **scale-invariant variance check** and a **more sensitive eval** (turn-subset / longer-horizon /
 closed-loop), and (b) pursue a **stronger world target** (A1/A2 objective fixes, then JEPA) that might yield a
 larger, more reliable downstream effect. The 2-seed result here is the error-bar reality check that the
 2026-06-25 single-seed conclusion explicitly asked for.
@@ -1922,5 +1922,315 @@ larger, more reliable downstream effect. The 2-seed result here is the error-bar
 **Data-recovery procedure used (for reference).** Both killed seed-1 runs were completed *without* retraining:
 copy the HF model (`model-*.safetensors` + config + tokenizer) from `checkpoint-900` → run-dir root; regenerate
 the 4 loss plots from `run.log`/`trainer_log.jsonl` (`scripts/plot_losses.py` + `llamafactory…plot_loss`); then
-run the test-set L2 (`infer_local_multi_gpu --test`) and `probe_world_collapse.py` on the root model. Result:
-the dirs match completed runs (model + `test.log`/`test_plots`/`test_infer.json` + `collapse.log` + 4 plots).
+run the test-set L2 (`infer_local_multi_gpu --test`) and `variance_check.py` on the root model. Result:
+the dirs match completed runs (model + `test.log`/`test_plots`/`test_infer.json` + `variance_check.log` + 4 plots).
+
+---
+
+### 2026-06-27 — PLANNED (not yet run): a sharper E2 read — per-maneuver/per-horizon re-scoring + clean seed-1 models
+
+**Status: designed, deferred — to revisit.** The 2026-06-26 two-seed result left E2 at a null *as aggregated*:
+the world head learns reliably (EV ~37 %, both seeds) but its open-loop L2 benefit appears in seed 0 (Δ=+0.047,
+t=2.6) and vanishes in seed 1 (Δ=−0.002). Before concluding "no benefit," two confounds (both flagged in the
+2026-06-26 caveats) should be removed. This entry records the plan so we can pick it up later.
+
+**Key idea — the verdict is a *statistic over a chosen population*, not an L2 number.** Re-scoring the existing
+predictions does **NOT** change any per-sample L2 (same model → same predictions → same GT → deterministic). What
+it changes is *which samples we aggregate the λ0-vs-λ2 comparison over*, which is what the conclusion actually
+rests on. Why this matters here: our test set is **mostly easy straight frames** (2026-06-12: `std > mean`, many
+per-sample mins = 0.000) where both arms predict the near-deterministic future almost identically (per-sample
+λ0−λ2 ≈ 0). If the world head helps, it helps on **turns / junctions / interactions** — a small minority. The
+**pooled mean dilutes** a turn-localized effect under a mass of ~0 diffs **plus heavy tails**, and the
+between-seed noise lives in exactly those tails — so a real-but-concentrated effect can read significant in one
+seed and wash to null in another *even though the same model is scored*. The pooled mean is provably the wrong
+lens for a turn-localized effect; a per-maneuver paired test is the right one. (This is also the eval-sensitivity
+problem the 2026-06-22 / 2026-06-26 entries called out: open-loop L2 saturates on straight-line kinematics and is
+blind to the head; closed-loop, the paper's +26 DS axis, is blocked by the CARLA graphics pod.)
+
+**Two-part plan.**
+
+1. **Per-maneuver / per-horizon re-scoring (deterministic re-lens, no inference, minutes/CPU).** New script
+   (e.g. `src/tools/eval_l2_strata.py`): read the existing `test_infer.json` from all 4 A3 runs
+   (`ad_bev_e2_4_A3_lambda{0,2}_seed{0,1}`), label each of the 499 test samples **straight vs turn/junction**
+   (default: from GT-trajectory heading-change over the 2 s horizon — self-contained; alternative: the route
+   command token already in the prompt) and by **horizon (1s/2s)**, then report the paired λ0−λ2 Δ/SE/t **per
+   stratum, per seed**, plus a **cross-seed pooled paired test on the turn subset**. Sanity gate: the all-sample
+   stratum must reproduce the logged numbers (0.681/0.634/0.663/0.670) exactly — proving the re-scoring is
+   faithful and adds no new numbers, only a sharper aggregation. Three informative outcomes: (a) both seeds show
+   a consistent turn-subset gain the straight mass was burying → **rescues** "it helps"; (b) even on turns seed 1
+   shows nothing → **confirms** the null with more authority; (c) mixed → the effect is genuinely fragile.
+
+2. **Clean-resume the two killed seed-1 runs (this *does* change numbers — different model).** The seed-1 runs
+   are `checkpoint-900` snapshots of *killed* runs, not `load_best_model_at_end` completions (λ0-seed1 sits at
+   step 900 while λ0-seed0's best was ~step 600 — not apples-to-apples). Resume from the intact DeepSpeed state
+   in `saves/ad_bev_e2_4_A3_lambda{0,2}_seed1/` to proper early-stop, consolidate the root model, regenerate
+   plots, re-run `--test` L2 + `variance_check.log`, then re-apply step 1 to the cleaned models. Cost: only the
+   remaining steps (~hours) on the 2 free GPUs.
+
+**Open calls for when we resume:** (a) the maneuver-labeling criterion (GT heading-change vs route command
+token); (b) whether to do the seed-1 resume at all, or just re-score the dirty checkpoints first and decide from
+the strata. This is **Tier 1** of the broader offer (sharper-read first; then Tier 2 = seed-2 for both arms /
+3 clean seeds, Tier 3 = scale-invariant variance check + A1/A2 anti-collapse on small data as the JEPA on-ramp,
+Tier 4 = push frames/scene toward EV→54 % for a dose-response ceiling check).
+
+---
+
+### 2026-06-27 (cont.) — E2-4 A4 designed: the data-SCALE arm (push EV toward the released regime, then re-test the trajectory ablation)
+
+**The design, and what it's based on.** A4 is the chosen realization of **Tier 4** above — a *dose-response* follow-up
+to the A3 finding. The reasoning chain that produced it:
+
+1. **What A3 settled (2026-06-24/25/26).** Scene *diversity* reliably un-collapses the DINOv3 world head — EV
+   jumped **5 % → 37.7 %** going from 211 → 10 000 train scenes, and that cure **replicated across 2 seeds**
+   (37.7 / 37.1). So the world objective is sound *given enough diversity*; the small-scale null was a collapse
+   artifact, not evidence against world modeling.
+2. **What A3 left open.** (a) The head only reached **PARTIAL** (EV ~38 %), short of the released checkpoint's
+   **54 %** — A3 used just **2 frames/scene**, far fewer than the released full-scale training. (b) The *trajectory*
+   payoff (λ2 vs λ0 open-loop L2) **did not replicate** — significant in seed 0 (Δ=+0.047, t=2.6), null in seed 1.
+   The 2026-06-26 next-steps explicitly asked to *"push diversity/frames toward the released regime (EV→54 %) to
+   see if the L2 gain grows with EV"* and to *add seeds*.
+3. **The lever: frames-per-scene.** There is now a clean monotonic EV trend with data scale —
+   **211 scenes → 5 %; 10 000×2 → 38 %; released (full, many frames) → 54 %.** A3 was scene-rich but
+   frame-poor (2/scene). The natural next dose is to **hold scene count and multiply frames/scene**, moving up
+   that curve toward the released regime — *without* changing the objective (still plain MSE, so the raw-MSE
+   variance check stays valid).
+
+**A4 = same recipe as A3, 4× the frames/scene, on 8 GPUs.** Everything that made A3 a clean controlled test is
+kept identical so A3↔A4 is a pure data-scale comparison: full-FT from `deepsight_warmstart`, vision+DINOv3 frozen,
+**plain MSE**, lr 2e-5, **effective batch 64**, cosine + warmup 0.03, eval-loss early-stopping, the λ0/λ2 ×
+seed{0,1} ablation, and a disjoint held-out test. Only the **data scale** and **GPU count** change:
+
+| knob | A3 (`b2d_20000`) | **A4 (`b2d_80000`)** |
+|---|---|---|
+| train | 10 000 `full` scenes × **2** frames = 20 000 | 10 000 `full` scenes × **8** frames = **80 000** |
+| eval / test (disjoint `base`) | 500×1 / 499×1 | **200×5 = 1000** / **800×5 = 4000** |
+| GPUs / batch | 4 × (1×4×16)=64 | **8** × (per_device **2** × 8 × accum **4**) = 64 |
+| epochs / lr | 4 (early-stopped) / 2e-5 | **2** / 2e-5 |
+| eval & save cadence | every 100 steps | every **500** steps |
+
+**Two questions A4 is built to answer.** (1) *Does more frames/scene push EV past PARTIAL toward the released
+54 %?* — i.e. is the EV-vs-scale curve still climbing, confirming the data-scale mechanism. (2) *With a
+healthier (higher-EV) head, does the λ2-vs-λ0 open-loop trajectory benefit get larger / more reproducible?* —
+the fair, more-sensitive re-test of "does the world head help the policy," now at higher EV and with seeds.
+
+**Supporting infra built for A4 (design-time).**
+- **Renamed `local_data/e2_4_A3` → `local_data/b2d_20000`** (and repointed its `dataset_info.json` + the four A3
+  configs' `dataset_dir`) — decoupling *data* names (content-based: `b2d_<N>`) from *experiment-arm* names
+  (`ad_bev_e2_4_A3_*`), since the same data can serve multiple arms. `e2_4_A3_smoke` and all save/experiment
+  names left unchanged.
+- **Generalized the builder** `scripts/build_e2_4_A3.py → scripts/build_b2d.py` (per-split scene-count + frames/
+  scene args; eval/test were previously hard-wired to 1 frame). Built **`local_data/b2d_80000`** with it.
+- **Confirmed 1000 `base` scenes** (a missing trailing newline had made `wc -l` report 999), so eval 200 + test
+  800 = exactly 1000 disjoint base scenes. Verified **zero overlap** across train/eval/test (scene *and* sample),
+  train drawn only from `full`, eval/test only from `base` (`full ∩ base = 0`).
+- **Configs:** `configs/ad_bev_e2_4_A4_{lambda0,lambda2}_seed{0,1}.yaml` (mirrors of the A3 set, repointed to
+  `b2d_80000`, 8-GPU effective-batch-64, eval/save 500, lr 2e-5, 2 epochs).
+
+This sits in the roadmap as the **dose-response ceiling check** (Tier 4): if EV keeps climbing toward 54 % and a
+healthier head buys a clearer trajectory gain, it both validates the data-scale mechanism end-to-end and gives
+the strongest *working-head* baseline for the JEPA upgrade to beat. (Results — EV verdict, L2, and an operational
+note on an 8-GPU end-of-training hang — to be logged once the L2 test completes.)
+
+---
+
+### 2026-06-29 — E2-4 A4 RESULTS: the world head is now HEALTHY, yet gives ZERO open-loop trajectory benefit (clean null)
+
+Both A4 arms (seed 0) are complete on the SAME max-scale data (`b2d_80000`: 8 frames × 10 000 `full` scenes →
+80 000 train; held-out **4000-sample** `base` test), SAME recipe (full-FT, lr 2e-5, eff-batch 64, vision+DINOv3
+frozen, plain MSE), differing ONLY in `world_loss_weight`:
+- **λ2 (world head ON)** `1782584042_ad_bev_e2_4_A4_lambda2_seed0` — trained 2 epochs (final eval_loss 0.3705);
+  hung at end-of-training consolidation, recovered from `checkpoint-2500` (the best-by-eval-loss = last step).
+- **λ0 (world head OFF)** `1782639461_ad_bev_e2_4_A4_lambda0_seed0` — the matched control (`vis_head` gets no
+  gradient → stays random).
+
+| arm | world head | collapse `loss_gen` / EV (vs per-dim) | verdict | test L2 1s | 2s | **overall** |
+|---|---|---|---|---|---|---|
+| λ0 (OFF) | random `vis_head` | 3.75 / **−7579 %** | **LOW-VARIANCE** (untrained, by design) | 0.3928 | 0.8693 | **0.6310** |
+| **λ2 (ON)** | trained | 0.027 / **44.8 %** | **HEALTHY** | 0.3887 | 0.8731 | **0.6309** |
+
+(EV vs this dataset's own DINOv3 baselines: std 0.2704, per-dim 0.0489, per-pos 0.0422. λ2 also beats the
+per-position template: EV-perpos 36 %.)
+
+**Paired per-sample L2 (same 4000 test samples, λ0−λ2, >0 ⇒ λ2 better):**
+
+| horizon | paired Δ | SE | t | read |
+|---|---|---|---|---|
+| 1 s | +0.0041 | 0.0039 | +1.04 | n.s. |
+| 2 s | −0.0039 | 0.0088 | −0.44 | n.s. |
+| **overall** | **+0.0001** | 0.0062 | **+0.02** | **dead null** |
+
+#### Finding 1 — collapse cure is a clean DOSE-RESPONSE; A4 is the first locally-trained HEALTHY head.
+
+Going from A3's 2 frames/scene to A4's 8 frames/scene (20 k → 80 k samples, same 10 k scenes) pushed the world
+head **PARTIAL → HEALTHY**: EV **37.7 % → 44.8 %**, beating the per-position template, approaching the released
+54 %. The full monotone curve is now: **211 scenes → 5 %; 10 k×2 → 38 %; 10 k×8 → 45 %; released → 54 %.** More
+frames/scene reliably moves the head up toward the released regime — the data-scale mechanism is confirmed
+end-to-end. (λ0's LOW-VARIANCE reading just confirms its `vis_head` is genuinely untrained — a true no-world
+baseline.)
+
+#### Finding 2 — a HEALTHY world head still does NOT help the open-loop trajectory. This is the decisive null.
+
+λ2 ≈ λ0 to within **0.0001 m overall** (t = 0.02) on a **4000-sample paired** test — the highest-powered, cleanest
+test in the entire E2 arc. This **resolves the A3 ambiguity against the world head (for open-loop)**:
+- E2-3 (small data): λ2≈λ0, but the head was LOW-VARIANCE → unfair test.
+- A3 (10 k×2): head PARTIAL; λ2 beat λ0 at seed 0 (+0.047, t=2.6) but the effect **vanished at seed 1** → inconclusive.
+- **A4 (10 k×8): head HEALTHY, and the benefit is now exactly ZERO** on 8× the test data. The A3 seed-0 +0.047
+  was almost certainly noise (it neither replicated across seeds nor survived a better head + larger test).
+
+So A4 cleanly **disentangles two questions that were always confounded**:
+1. *Does the DINOv3 world objective LEARN?* → **Yes, reliably and now healthily** (EV scales with frames/scene).
+2. *Does a learned/healthy world head improve the open-loop trajectory?* → **No** (clean, well-powered null).
+
+#### Interpretation — two explanations, both consistent with A4; only closed-loop can separate them.
+
+(a) **The world head is decorative for the open-loop trajectory.** The waypoints are produced by `lm_head` from the
+text/CE path (`loss_rec`); the world latent is `vis_head`-only, stripped at serving (`merge_model_weight.py`) and
+unread at inference. A4 shows the trajectory output is driven entirely by the CE path — turning the (now healthy)
+world objective on vs off changes open-loop L2 by nothing.
+(b) **Open-loop L2 is simply blind to the world head.** The head demonstrably encodes real future-BEV structure
+(EV 45 %) yet L2 is unmoved — exactly what you'd see if its benefit lives on the closed-loop axis (the paper's
+effect is **+26 DS closed-loop**, never an open-loop-L2 claim). A4 *strengthens* this reading: we now have a
+provably-working head and a provably-flat open-loop metric.
+
+A4 cannot distinguish (a) from (b) — that needs **closed-loop CARLA**. What A4 *does* settle: **open-loop L2 is a
+dead axis for this question** (a healthy head moves it by 0.0001), so no further open-loop ablation is worth
+running. Side observation: more data did improve the *base policy* (A4 λ0 overall 0.631 vs A3 λ0 seed-0 0.681) —
+i.e. scale helps the trajectory via the CE/policy path, not via the world head (loose: different test sets).
+
+#### Caveats.
+- **Single seed per A4 arm** (seed 0). The 4000-sample paired test gives very tight *within-run* estimates, but
+  run-to-run (init/data-order) variance isn't captured. Given t=0.02, a seed swap is extremely unlikely to
+  manufacture a real effect, but A4 seed 1 would formally close it.
+- **Open-loop L2 only**; closed-loop (the paper's sensitive axis) remains blocked by the CARLA graphics pod.
+- L2 ~0.63 is on our `b2d_80000` base-scene 2 s test with our averaging convention — not byte-matched to the
+  paper's 0.58.
+- **Operational:** `load_best_model_at_end: true` + DeepSpeed ZeRO-2 on **8 GPUs** deadlocks at end-of-training
+  (ranks diverge on `best_model_checkpoint is not None` → barrier-vs-`store_flos` collective mismatch; py-spy
+  confirmed). Both A4 runs hit it; recovered cleanly from `checkpoint-2500` (best = last). **Fix for future arms:
+  set `load_best_model_at_end: false`** (eval still logged; pick best post-hoc from `trainer_state.json`).
+
+#### Implication for the roadmap / JEPA.
+This is the cleanest statement E2 can make: *the frozen-DINOv3 world objective is a sound, healthy
+representation learner whose open-loop policy payoff is null even when it learns well.* Consequences:
+1. **The decisive test is now unambiguously closed-loop** — open-loop L2 is settled (null) and demonstrably
+   insensitive. Any future world-model claim (current head OR JEPA) must be made on CARLA DS/SR, not L2.
+2. **JEPA's value proposition is reframed.** "Fix a broken (collapsing) component" is no longer the pitch — we
+   *did* fix collapse (via data scale), and a healthy head still didn't help open-loop. JEPA must justify itself
+   on the dynamics-aware/closed-loop axis (or a more direct policy-sensitivity probe), not on open-loop L2.
+3. The A4 λ2 HEALTHY checkpoint (EV 45 %) is the strongest *working-head* baseline we have for any such future
+   comparison.
+
+---
+
+### 2026-06-29 (cont.) — TERMINOLOGY: "collapse" → "variance check" / mean-prediction underfitting
+
+**What changed and why.** We have been calling the small-data, predict-the-mean phenomenon **"collapse"** since
+2026-06-22. That label is **inaccurate** and is now retired. The decisive reason: the phenomenon was **cured by
+data scale alone, with the identical objective** (EV ~5 % → 38 % → 45 % as scenes/frames grew — see 2026-06-24
+and the 2026-06-29 A4 results). **True representation collapse is *not* data-curable** — it's a property of the
+*objective* admitting a trivial input-independent optimum (and, in the EMA/non-contrastive case, a dynamical
+instability), fixed by changing the loss (stop-grad / predictor / VICReg variance-covariance), not by adding
+data. What we actually had was **regression to the mean under low target variance**: with low-diversity DINOv3
+targets the per-dim mean is near-optimal under unnormalized MSE, so the gradient toward scene-specific structure
+vanishes and the head **underfits to the mean**. More diverse targets restore that gradient and the head learns.
+That is ordinary **weak-signal underfitting**, not collapse.
+
+**New naming (project-wide, applied today).**
+- The diagnostic is the **variance check** — it measures *explained variance* (EV = 1 − loss_gen / MSE-to-mean)
+  of the world head vs the predict-the-mean baselines. Renamed: `scripts/probe_world_collapse.py` →
+  **`scripts/variance_check.py`**; per-run artifact `collapse.log` → **`variance_check.log`**; verdict band
+  **`COLLAPSED` → `LOW-VARIANCE`** (PARTIAL / HEALTHY unchanged); `train.sh`, all `configs/`, `build_b2d.py`, and
+  the `world_loss_type` knob comments in `modeling_qwen2_5_vl.py` / `finetuning_args.py` / `workflow.py` updated to
+  the variance framing. EV bands and thresholds are **unchanged** (≤10 % LOW-VARIANCE, ≥40 % HEALTHY).
+- In prose we now say **"low explained variance" / "predicts ~the mean" / "mean-prediction underfitting"** for the
+  fixed-teacher phenomenon, and **reserve the word "collapse" for the genuine EMA/JEPA dynamical case**
+  (`WORLD_MODEL_JEPA.md` keeps "collapse" exactly there — the co-evolving teacher that VICReg/stop-grad defend
+  against; its frozen-teacher critique was relabeled to "mean-reversion").
+
+**Reading the earlier entries (2026-06-22 → 2026-06-26).** Their narrative is **preserved as the historical
+record** of how the understanding evolved — every "collapse" / "collapsed" / "feature collapse" there refers to
+this same **low-explained-variance / mean-prediction underfitting** phenomenon (tool/verdict references in those
+entries were updated to `variance_check` / `LOW-VARIANCE`; the reasoning prose was intentionally left intact,
+including that we *initially mis-named* it — exactly the correction recorded here). The diagnostic, the EV
+numbers, and the conclusions are all unchanged; only the name is more honest.
+
+**One nice consistency this buys.** `WORLD_MODEL_JEPA.md`'s table already said *"Collapse risk: none (fixed
+teacher)"* — under the corrected terminology that is now self-consistent: the fixed DINOv3 teacher never truly
+collapses; at low diversity it merely **underfits to the mean** (low variance check), and the JEPA EMA teacher is
+where real collapse risk — and the anti-collapse machinery — actually enters.
+
+---
+
+### 2026-06-29 (cont.) — DIRECTION: closed-loop CARLA looks ESSENTIAL to show the world head's benefit → it is now the main effort
+
+The A4 result forces a conclusion about *methodology*, not just about the world head: **open-loop L2 cannot
+demonstrate (or refute) the world head's value, so closed-loop CARLA evaluation appears essential.** The evidence:
+- A4's world head is **demonstrably healthy** (variance check EV 45 %, beating the per-position template — it
+  encodes real scene-specific future-BEV structure), yet turning it on vs off moved open-loop L2 by **0.0001 m**
+  (paired t = 0.02, n = 4000). A provably-working head + a provably-flat metric ⇒ the metric is **blind** to
+  whatever the head contributes.
+- This is consistent with the paper itself: its world-model effect is reported **only closed-loop** (WM off→on =
+  **+26 DS / +37.7 SR**, the single biggest contributor in `tab:method_comparison`) and **never** as an open-loop
+  L2 gain. So the head's benefit — if real — lives on the closed-loop axis (reactive, multi-step, error-compounding
+  driving), which open-loop teacher-forced 2 s L2 structurally cannot see.
+
+**Therefore the main near-term effort shifts to getting closed-loop Bench2Drive (CARLA) evaluation running.** It is
+the only axis that can actually test "does the world head help the policy?", and it is equally the only honest way
+to later judge the JEPA upgrade (whose entire pitch is now closed-loop / dynamics-aware, since open-loop is
+settled-null). Enabler status: the CARLA/Vulkan pod-graphics blocker was resolved (`scripts/setup_carla_vulkan.sh`
++ graphics caps in `config.yaml`); the closed-loop agent is `bench2drive/team_code/qwen_b2d_agent.py` and the
+run entry is `bench2drive/leaderboard/scripts/run_evaluation_qwen.sh`. Plan: stand up the closed-loop eval, then
+score the A4 λ2 (HEALTHY) checkpoint vs the λ0 control on Bench2Drive DS/SR — the first test on an axis that *can*
+register a world-head effect.
+
+---
+
+### 2026-06-29 (cont.) — CARLA closed-loop ENABLEMENT progress (Phases 0–1 done; full runbook in [CARLA.md](CARLA.md))
+
+Standing up the closed-loop Bench2Drive (CARLA) eval on this headless 8×A100 k8s pod. Two hard blockers were
+root-caused and fixed; the server now renders and the client env is built. **Phases 0–1 complete, Phase 2 (wire
+the eval scripts) is the immediate next step.** Detailed runbook + commands live in [CARLA.md](CARLA.md); summary:
+
+**Blocker 1 — Vulkan (graphics capability), resolved 2026-06-26.** The pod was provisioned compute-only
+(`NVIDIA_DRIVER_CAPABILITIES=compute,utility`), so NVIDIA's Vulkan ICD returned `VK_ERROR_INITIALIZATION_FAILED`
+before any `/dev/nvidia*` access — unfixable from inside a running pod. Fix: **recreate the pod with graphics
+caps** (`config.yaml` → `NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display`), then install two in-pod
+OS packages: **`libvulkan1`** (loader) + **`libegl1`** (the NVIDIA Vulkan driver `dlopen`s `libEGL.so.1` at init;
+without it negotiation fails). Result: `vulkaninfo --summary` → **8× A100 80 GB**, driver 550.54.15.
+**Vulkan adapter index == CUDA index** here, so CARLA's `-graphicsadapter=N` targets CUDA GPU N directly; all 8
+GPUs can host CARLA. ⚠️ The apt installs are on the **ephemeral** container FS — re-run
+**`scripts/setup_carla_vulkan.sh`** after any pod restart (repo lives on persistent `/home/saab03`).
+
+**Blocker 2 — RenderThread timeout = NFS, resolved 2026-06-29 (Phase 0 done).** Every launch died after ~60 s
+with `GameThread timed out waiting for RenderThread after 60.00 secs → Signal 11`, identically on any GPU. Root
+cause was **slow disk I/O, not the GPU**: CARLA (UE4 4.26) streams ~20 GB of `.uasset`/`.ubulk` assets at startup,
+and we had extracted it onto **NFS** (`/home/saab03`), where every read is a network round-trip → the RenderThread
+blocked past UE4's 60 s fence. **Fix: run CARLA from LOCAL disk** — copied the tree to `/opt/carla/CARLA_0.9.15`
+(container overlay, NVMe-class latency). Same GPU/flags, only storage changed → server now boots, stays stable
+>4 min, attaches to the GPU (~5.8 GB), Python client (0.9.15) connects, maps load. ⚠️ `/opt` is **ephemeral** too:
+re-copy from the persistent NFS tarball/extract at `/home/saab03/carla/` after a restart.
+
+**Install facts.**
+- **CARLA 0.9.15** (bench2drive is pinned to it). Tarballs (`CARLA_0.9.15` 7.9 G + `AdditionalMaps` 6.9 G) persist
+  on NFS `/home/saab03/carla/`; **base extracted + copied to `/opt/carla/CARLA_0.9.15`** (Town01-05+10HD, enough
+  for the smoke test). **AdditionalMaps NOT extracted** yet (needed for Town12/13/15 in the full 220).
+- **Phase 1 env `carla-eval` (py3.10)** built: `carla==0.9.15` (a **cp310** PyPI wheel exists → matches the
+  server in py3.10), torch 2.7.1+cu126, **transformers 4.51.3**, qwen-vl-utils, accelerate, opencv, scipy,
+  shapely, py-trees 0.8.3. Resolved: **use STOCK transformers**, not the vendored `src/transformers` — the agent
+  only does `model.generate()`, so the training-only `dino*`/`vis_head*` keys are harmlessly ignored at inference.
+- Non-root user **`carla` (uid 1001)** created — UE4 refuses to run as root; CARLA files chowned to it.
+
+**Key gotchas (learned the hard way):** run CARLA **as user `carla`**, not root; force NVIDIA ICD
+(`VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_icd.json`) or UE4 may pick mesa llvmpipe; detach with `setsid` +
+`</dev/null` (else it dies when the launching shell exits); kill with **`pkill CarlaUE4`** — **NOT `pkill -f`**
+(the `-f` pattern self-kills the launching shell; caused many phantom failures); on this shared node use
+`nvidia-smi --query-compute-apps` + GPU-UUID to find a truly-free GPU.
+
+**Status & next.** Phase 0 (server renders headless) ✅, Phase 1 (eval env) ✅. **Phase 2 = wire the scripts**
+(not started): `CARLA_ROOT=/opt/carla/CARLA_0.9.15` in `run_evaluation.sh`; checkpoint/routes/GPU in
+`run_evaluation_qwen.sh`; make the hardcoded `-graphicsadapter=4` env-driven + force the NVIDIA ICD at
+`leaderboard_evaluator.py:208`; run the **whole eval as user `carla`** (it spawns CARLA itself). Then Phase 3
+single-route smoke (`smoke_test_town03.xml`) → Phase 4 parallel 220 → Phase 5 metrics. The previously-open
+**"need a checkpoint from the user"** item is now satisfied: the **A4 λ2 (HEALTHY) and λ0 control** checkpoints
+are the first eval targets (per the closed-loop direction note above). See [CARLA.md](CARLA.md) for the exact
+launch commands, the `-graphicsadapter` mapping, and the parallel-launch template.
